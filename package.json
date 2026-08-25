@@ -1,0 +1,18 @@
+{
+  "name": "spartan-chatbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AWS Lambda (Function URL) chatbot for the Spartan Capital Group website",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "rm -rf build function.zip && mkdir -p build && cp index.js systemPrompt.js intent.js package.json package-lock.json build/ && npm ci --omit=dev --prefix build && cd build && zip -qr ../function.zip . && cd .. && rm -rf build",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0"
+  }
+}
