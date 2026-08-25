@@ -9,7 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "rm -rf build function.zip && mkdir -p build && cp index.js systemPrompt.js intent.js package.json package-lock.json build/ && npm ci --omit=dev --prefix build && cd build && zip -qr ../function.zip . && cd .. && rm -rf build",
+    "build": "rm -rf build function.zip && mkdir -p build && cp index.js systemPrompt.js intent.js salesforce.js leadHandoff.js package.json package-lock.json build/ && npm ci --omit=dev --prefix build && cd build && zip -qr ../function.zip . && cd .. && rm -rf build",
     "test": "node --test"
   },
   "dependencies": {

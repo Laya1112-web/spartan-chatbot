@@ -13,7 +13,8 @@ import { randomUUID } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
-import { shouldHandoff, extractHandoffFields } from "./intent.js";
+import { shouldHandoff, recoverContactFields } from "./intent.js";
+import { maybeCreateLead } from "./leadHandoff.js";
 
 const MODEL = "claude-sonnet-5";
 const MAX_TOKENS = 1024;
@@ -93,28 +94,70 @@ export const handler = async (event) => {
       });
     }
 
-    // The model tags each reply OK/DECLINE (see systemPrompt.js). Strip the
-    // tag before it can reach a visitor, and use it to gate the handoff.
-    const { text, declined } = parseStatusTag(extractText(response));
-    const reply = text || EMPTY_REPLY_FALLBACK;
+    // The model tags each reply OK/DECLINE and, on a handoff turn, appends the
+    // fields it gathered (see systemPrompt.js). Strip both before either can
+    // reach a visitor; the status drives the gate, the block supplies values.
+    const status = parseStatusTag(extractText(response));
+    const lead = parseLeadBlock(status.text);
+    const reply = lead.text || EMPTY_REPLY_FALLBACK;
 
-    const handoff = shouldHandoff({ messages, reply, modelDeclined: declined });
-    const handoffFields = handoff ? extractHandoffFields(messages) : {};
+    const handoff = shouldHandoff({
+      messages,
+      reply,
+      modelDeclined: status.declined,
+    });
+    let handoffFields = handoff ? lead.fields : {};
 
-    // NOTE: handoff is only flagged here. Delivering it (Salesforce/CRM) is
-    // intentionally not part of this function.
+    if (handoff && Object.keys(lead.fields).length === 0) {
+      // The model handed off without reporting any fields — a prompt-tuning
+      // signal, so it is logged even when the fallback below rescues contact
+      // details.
+      console.warn("spartan-chatbot: handoff with no SCG_LEAD fields", { sessionId });
+    }
+
+    // Narrow gap-fill: contact details only, and only ones the model didn't
+    // report. Amounts are never recovered this way (see recoverContactFields).
+    if (handoff && (!handoffFields.email || !handoffFields.phone)) {
+      const recovered = recoverContactFields(messages);
+      const filled = {};
+      for (const key of ["email", "phone"]) {
+        // Whatever the model reported always wins; this only fills a gap.
+        if (!handoffFields[key] && recovered[key]) filled[key] = recovered[key];
+      }
+      if (Object.keys(filled).length > 0) {
+        handoffFields = { ...handoffFields, ...filled };
+        console.log("spartan-chatbot: recovered contact fields missing from SCG_LEAD", {
+          sessionId,
+          recovered: Object.keys(filled),
+        });
+      }
+    }
+
     if (handoff) {
       console.log("spartan-chatbot: handoff requested", {
         sessionId,
         fields: Object.keys(handoffFields),
       });
-    } else if (declined) {
+    } else if (status.declined) {
       console.log("spartan-chatbot: reply declined the business, handoff suppressed", {
         sessionId,
       });
     }
 
-    return json(200, headers, { reply, handoff, handoffFields, sessionId });
+    // Deliver the lead. Runs only now that `reply` has both tags stripped and
+    // the contact fallback has filled any gaps, so Salesforce sees the final
+    // field set. maybeCreateLead is gated on handoff === true and swallows
+    // every Salesforce failure, so this can neither create a lead for a
+    // declined business nor cost the visitor their reply.
+    const { leadId } = await maybeCreateLead({ handoff, handoffFields, sessionId });
+
+    return json(200, headers, {
+      reply,
+      handoff,
+      handoffFields,
+      sessionId,
+      ...(leadId && { leadId }),
+    });
   } catch (error) {
     if (error instanceof BadRequestError) {
       return json(400, headers, { error: error.message, sessionId });
@@ -260,6 +303,87 @@ function parseStatusTag(text) {
   return { text: stripped, declined };
 }
 
+/**
+ * The keys the model is allowed to report in an SCG_LEAD block. Anything else
+ * it emits is dropped rather than forwarded to Salesforce.
+ */
+const LEAD_FIELD_KEYS = [
+  "firstName",
+  "lastName",
+  "email",
+  "phone",
+  "businessName",
+  "monthlyRevenue",
+  "timeInBusiness",
+  "fundingAmount",
+  "loanPurpose",
+];
+
+const MAX_LEAD_FIELD_CHARS = 255;
+
+// Two passes: the first captures the JSON object, the second sweeps up any
+// remnant (a bracket-less or JSON-less tag) so nothing tag-shaped survives
+// into text a visitor reads.
+const LEAD_BLOCK_RE = /\[{0,2}\s*SCG[_\s-]?LEAD\s*:?\s*(\{[^\n]*\})\s*\]{0,2}/i;
+const LEAD_REMNANT_RE = /\[{0,2}\s*SCG[_\s-]?LEAD\b[^\n]*/gi;
+
+/** Whitelist, coerce to trimmed strings, drop blanks. */
+function sanitizeLeadFields(parsed) {
+  const fields = {};
+
+  for (const key of LEAD_FIELD_KEYS) {
+    const value = parsed[key];
+
+    if (Array.isArray(value)) {
+      const items = value
+        .filter((item) => typeof item === "string" && item.trim())
+        .map((item) => item.trim().slice(0, MAX_LEAD_FIELD_CHARS));
+      if (items.length) fields[key] = items;
+      continue;
+    }
+
+    // The model occasionally reports a figure as a number rather than a string.
+    const text = typeof value === "number" ? String(value) : value;
+    if (typeof text !== "string") continue;
+
+    const trimmed = text.trim();
+    if (trimmed) fields[key] = trimmed.slice(0, MAX_LEAD_FIELD_CHARS);
+  }
+
+  return fields;
+}
+
+/**
+ * Pull the model-reported handoff fields off the reply. A missing or malformed
+ * block yields no fields rather than an error — a broken block must never cost
+ * the visitor their answer.
+ */
+function parseLeadBlock(text) {
+  let fields = {};
+
+  const match = LEAD_BLOCK_RE.exec(text);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        fields = sanitizeLeadFields(parsed);
+      }
+    } catch {
+      // Malformed JSON — strip it below and carry on with no fields.
+    }
+  }
+
+  const stripped = text
+    .replace(LEAD_BLOCK_RE, "")
+    .replace(LEAD_REMNANT_RE, "")
+    .trim();
+
+  return { text: stripped, fields };
+}
+
 function json(statusCode, headers, payload) {
   return { statusCode, headers, body: JSON.stringify(payload) };
 }
+
+// Exported for tests only; the Lambda entry point is `handler`.
+export { parseStatusTag, parseLeadBlock };

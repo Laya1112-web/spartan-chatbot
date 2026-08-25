@@ -191,7 +191,69 @@ const PURPOSE_KEYWORDS = [
   "invoice",
 ];
 
+/** The visitor's own turns, joined. Never the assistant's. */
+function userTranscript(messages) {
+  return (messages || [])
+    .filter((m) => m && m.role === "user" && typeof m.content === "string")
+    .map((m) => m.content)
+    .join("\n");
+}
+
+function findEmail(transcript) {
+  return lastMatch(transcript, EMAIL_RE);
+}
+
+function findPhone(transcript) {
+  // Strip currency amounts before scanning for phone numbers so "$250,000"
+  // and "1,500,000 in revenue" can't be read as a phone number.
+  const phoneSource = transcript.replace(/\$\s?[\d,.]+/g, " ");
+  return lastMatch(phoneSource, PHONE_RE, (raw) => {
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length === 10) return formatPhone(digits);
+    if (digits.length === 11 && digits.startsWith("1")) {
+      return formatPhone(digits.slice(1));
+    }
+    return null;
+  });
+}
+
 /**
+ * NARROW fallback for when the model omits its SCG_LEAD block on a genuine
+ * handoff turn. Recovers contact details ONLY — email and phone.
+ *
+ * Nothing else may be recovered here, and that restriction is the whole point:
+ * an email address and a phone number cannot be confused with a money figure,
+ * so filling them in from the transcript carries no conflation risk. Revenue,
+ * funding amount, and purpose must come from the model's block and nowhere
+ * else — regex could not tell "$50k/month in revenue" from "$75k needed",
+ * which is the collision this design exists to eliminate. Do not widen this
+ * function to name, businessName, or any amount.
+ *
+ * @param {Array<{role: string, content: string}>} messages
+ * @returns {{email?: string, phone?: string}}
+ */
+export function recoverContactFields(messages) {
+  const transcript = userTranscript(messages);
+  const fields = {};
+
+  const email = findEmail(transcript);
+  if (email) fields.email = email;
+
+  const phone = findPhone(transcript);
+  if (phone) fields.phone = phone;
+
+  return fields;
+}
+
+/**
+ * NO LONGER THE SOURCE OF HANDOFF FIELDS. `index.js` now takes field values
+ * from the model's SCG_LEAD block instead (see systemPrompt.js), because regex
+ * extraction cannot tell "$50k/month in revenue" from "$75,000 of funding" —
+ * both matched AMOUNT_RE and collided in `loanAmount`.
+ *
+ * Kept for reference and still covered by tests; safe to delete along with its
+ * tests once nothing depends on it.
+ *
  * Best-effort extraction of anything a funding specialist would need in order
  * to follow up. Only keys that were actually found are returned.
  *
@@ -204,27 +266,14 @@ const PURPOSE_KEYWORDS = [
  *            loanPurpose?: string[]}}
  */
 export function extractHandoffFields(messages) {
-  const userTurns = messages
-    .filter((m) => m.role === "user")
-    .map((m) => m.content);
-  const transcript = userTurns.join("\n");
+  const transcript = userTranscript(messages);
 
   const fields = {};
 
-  const email = lastMatch(transcript, EMAIL_RE);
+  const email = findEmail(transcript);
   if (email) fields.email = email;
 
-  // Strip currency amounts before scanning for phone numbers so "$250,000"
-  // and "1,500,000 in revenue" can't be read as a phone number.
-  const phoneSource = transcript.replace(/\$\s?[\d,.]+/g, " ");
-  const phone = lastMatch(phoneSource, PHONE_RE, (raw) => {
-    const digits = raw.replace(/\D/g, "");
-    if (digits.length === 10) return formatPhone(digits);
-    if (digits.length === 11 && digits.startsWith("1")) {
-      return formatPhone(digits.slice(1));
-    }
-    return null;
-  });
+  const phone = findPhone(transcript);
   if (phone) fields.phone = phone;
 
   const name = lastMatch(transcript, NAME_RE, (_raw, groups) => {
