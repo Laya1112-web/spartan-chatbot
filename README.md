@@ -69,6 +69,49 @@ Response — `200`:
 **Other statuses:** `204` (CORS preflight), `405` (non-POST), `500` (safe generic message; the full
 error, including stack and Anthropic `request_id`, goes to CloudWatch).
 
+### `POST /` — `{ "action": "poll" }`
+
+The return path. A conversation claimed by a rep gets no bot reply, so the rep's answers reach the
+widget only by being fetched. Same function, same Function URL, same `x-widget-token` gate; it never
+reaches Claude.
+
+```json
+{ "action": "poll", "sessionId": "3cb524a3-...", "after": "2026-08-26T18:00:20.000Z" }
+```
+
+Response — `200`:
+
+```json
+{
+  "messages": [
+    { "id": "a02Ab000001XyZ", "body": "Dana here — got your details.", "sentAt": "2026-08-26T18:02:00.000Z" }
+  ],
+  "live": true,
+  "status": "Claimed",
+  "conversationId": "a01Ab000001AbC",
+  "sessionId": "3cb524a3-..."
+}
+```
+
+- **Only rep messages.** Inbound is the visitor's own text, and the bot's replies already reached
+  them in the chat response that produced them. Both bot and rep replies are `Direction__c =
+  'Outbound'` in Salesforce, so `Direction__c` alone cannot make that second cut — **authorship**
+  does: every `Message__c` this Lambda writes is created by the integration user, so the query
+  excludes `CreatedById = <integration user>`. The id comes free with the JWT auth (the token
+  response's identity URL); `SF_INTEGRATION_USER_ID` overrides it. With neither available the poll
+  falls back to matching the conversation's `Assigned_To__c`, and if that is empty too it returns no
+  messages rather than replaying the bot's own words back into the widget.
+- `after` is optional and accepts either an ISO timestamp (the `sentAt` of the last message shown —
+  preferred) or a `Message__c` id. Messages at or before it are not re-sent.
+- `live` is `true` only while `Status__c === 'Claimed'`. A `Closed` conversation still returns the
+  rep's final messages.
+- No conversation for that session yet → `{ "messages": [], "live": false, "status": null }`.
+- **Salesforce unreachable → still `200`,** with `{ "messages": [], "live": false, "error": true }`,
+  so the widget just retries on its next tick. A page polling every few seconds never gets a `500`.
+- One SOQL per poll, plus the external-id read that resolves the session; both reuse the cached
+  access token, so a warm container polls without re-authenticating.
+- `sessionId` is **required** here (a poll for no session is meaningless) — omitting it is a `400`.
+
 ### Handoff detection
 
 `handoff: true` fires when either:

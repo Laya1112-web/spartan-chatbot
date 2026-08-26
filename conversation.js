@@ -23,6 +23,7 @@
 import {
   getSfToken,
   invalidateSfToken,
+  integrationUserId,
   SF_API_VERSION,
   SF_FETCH_TIMEOUT_MS,
 } from "./salesforce.js";
@@ -149,17 +150,26 @@ async function sfRequest(authOrSession, path, { method = "GET", body } = {}) {
 
 /**
  * Fetch a Conversation__c by its session external id.
- * @returns {Promise<{id: string, status: string}|null>} null when none exists.
+ *
+ * Assigned_To__c comes back for the poll path's fallback author filter; it is
+ * unused by the sync path and costs nothing to select.
+ *
+ * @returns {Promise<{id: string, status: string, assignedTo: string|null}|null>}
+ *   null when none exists.
  */
 async function findConversation(sessionId, auth) {
   const path =
     `/sobjects/${CONVERSATION_OBJECT}/${SESSION_EXTERNAL_ID}/` +
-    `${encodeURIComponent(sessionId)}?fields=Id,Status__c`;
+    `${encodeURIComponent(sessionId)}?fields=Id,Status__c,Assigned_To__c`;
 
   const { status, body } = await sfRequest(auth, path);
   if (status === 404 || !body || !body.Id) return null;
 
-  return { id: body.Id, status: body.Status__c ?? null };
+  return {
+    id: body.Id,
+    status: body.Status__c ?? null,
+    assignedTo: body.Assigned_To__c ?? null,
+  };
 }
 
 /**
@@ -402,8 +412,242 @@ async function recordVisitorTurn({
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Poll: the return path, Salesforce -> widget.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Most recent rep messages returned in one poll.
+ *
+ * A live conversation is polled every few seconds, so the realistic delta is
+ * zero or one message; this cap only bounds the pathological case (a widget
+ * reconnecting after a long gap, or a rep pasting a burst). Saturation is
+ * logged rather than silently truncated.
+ */
+const POLL_PAGE_SIZE = 50;
+
+/** Salesforce record id, 15- or 18-character form. */
+const SF_ID_RE = /^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$/;
+
+/**
+ * Interpret the widget's `after` cursor, which crosses the trust boundary and
+ * therefore may never reach a SOQL string unvalidated.
+ *
+ * Both forms the widget may send are accepted:
+ *   - an ISO timestamp (what `sentAt` in a poll response carries) -> compared
+ *     against Sent_At__c;
+ *   - a Message__c id -> everything up to and including it is dropped from the
+ *     fetched window, since SOQL cannot order by "after this record" without a
+ *     second query for its timestamp, and one query per poll is the budget.
+ *
+ * Anything unparseable degrades to "no cursor" rather than to an error: a
+ * malformed cursor should cost the visitor a duplicate at worst, never the
+ * rep's reply.
+ */
+function parsePollCursor(after) {
+  if (typeof after !== "string" || !after.trim()) return {};
+
+  const raw = after.trim();
+
+  const ms = Date.parse(raw);
+  if (!Number.isNaN(ms)) return { afterMs: ms };
+
+  if (SF_ID_RE.test(raw)) return { afterId: raw };
+
+  return {};
+}
+
+/**
+ * SOQL datetime literal. Salesforce wants YYYY-MM-DDThh:mm:ssZ, and older API
+ * versions reject the millisecond form, so the literal is floored to the
+ * second. Flooring widens the window rather than narrowing it — the exact
+ * millisecond comparison is redone in JS below, so the widened SOQL filter
+ * costs a row or two of payload and can never skip a message.
+ */
+function soqlDateTime(ms) {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/**
+ * When Sent_At__c is missing, fall back to CreatedDate.
+ *
+ * Rep messages are created by Salesforce, not by this Lambda, so nothing here
+ * guarantees their Sent_At__c is stamped. Ordering and cursoring on a null
+ * would drop those replies on the floor forever, which is the one outcome this
+ * feature cannot have.
+ */
+function sentAtOf(record) {
+  return record?.Sent_At__c || record?.CreatedDate || null;
+}
+
+/**
+ * Build the WHERE clause that separates rep messages from the bot's own.
+ *
+ * Both branches filter on authorship — see integrationUserId in salesforce.js
+ * for why CreatedById is the discriminator. Every literal interpolated here is
+ * either a Salesforce-supplied id or one this module validated, never raw
+ * caller input.
+ *
+ * @returns {{clause: string, basis: string}|null} null when authorship cannot
+ *   be established at all, which must suppress the whole poll: returning
+ *   unfiltered Outbound would replay the bot's own replies into the widget as
+ *   though a rep had just sent them.
+ */
+function repAuthorFilter(conversation, auth, logger) {
+  const botUserId = integrationUserId(auth);
+  if (botUserId) {
+    return { clause: `CreatedById != '${botUserId}'`, basis: "not-bot" };
+  }
+
+  // No identity URL on the token and no override configured. The rep who took
+  // the conversation is the next-best author to match on.
+  const assignedTo = conversation.assignedTo;
+  if (typeof assignedTo === "string" && SF_ID_RE.test(assignedTo)) {
+    return { clause: `CreatedById = '${assignedTo}'`, basis: "assigned-rep" };
+  }
+
+  logger.error(
+    "[conversation] poll cannot identify the integration user and the " +
+    "conversation has no Assigned_To__c; suppressing rep messages rather " +
+    "than replaying the bot's own replies. Set SF_INTEGRATION_USER_ID.",
+  );
+  return null;
+}
+
+/**
+ * Rep replies for a session, for the widget's poll.
+ *
+ * ONE SOQL per poll, on top of the external-id retrieve that resolves the
+ * session to a conversation. Both reuse the cached access token, so a warm
+ * container polls without re-authenticating.
+ *
+ * Only Outbound is returned, and only the Outbound the bot did not write:
+ * Inbound is the visitor's own text, and the bot's Outbound already reached the
+ * visitor in the chat response that produced it. Direction__c alone cannot make
+ * that second cut — bot replies are Outbound too — so authorship makes it.
+ *
+ * Never throws. A Salesforce failure returns `error: true` with no messages, so
+ * the widget simply polls again.
+ *
+ * @returns {Promise<{messages: Array<{id: string, body: string, sentAt: string|null}>,
+ *   live: boolean, status: string|null, conversationId?: string, error?: true}>}
+ */
+async function pollRepMessages({
+  sessionId, after = null, limit = POLL_PAGE_SIZE, logger = console, deps = {},
+}) {
+  const empty = { messages: [], live: false, status: null };
+  if (!sessionId || !isSalesforceConfigured()) return empty;
+
+  try {
+    const session = toSession(deps.auth || null, deps);
+    const auth = await session.get();
+
+    const conversation = await (deps.findConversation || findConversation)(sessionId, session);
+    // Nothing to poll yet: the conversation is only created at handoff.
+    if (!conversation) return empty;
+
+    const base = {
+      messages: [],
+      live: isClaimed(conversation.status),
+      status: conversation.status ?? null,
+      conversationId: conversation.id,
+    };
+
+    const author = repAuthorFilter(conversation, auth, logger);
+    if (!author) return base;
+
+    const cursor = parsePollCursor(after);
+
+    const where = [
+      `Conversation__c = '${conversation.id}'`,
+      `Direction__c = '${DIRECTION_OUTBOUND}'`,
+      author.clause,
+      // `OR Sent_At__c = null` keeps an unstamped rep message in the window;
+      // sentAtOf gives it a comparable timestamp and the JS filter below
+      // decides it on CreatedDate.
+      ...(cursor.afterMs
+        ? [`(Sent_At__c >= ${soqlDateTime(cursor.afterMs)} OR Sent_At__c = null)`]
+        : []),
+    ].join(" AND ");
+
+    // Newest-first with a LIMIT, then reversed below: a widget returning after
+    // a long gap gets the most recent window rather than being pinned to the
+    // oldest messages of a long conversation. Ascending order is restored for
+    // the caller, which is the order the widget renders in.
+    const soql =
+      `SELECT Id, Body__c, Sent_At__c, CreatedDate FROM ${MESSAGE_OBJECT} ` +
+      `WHERE ${where} ORDER BY Sent_At__c DESC NULLS LAST LIMIT ${Number(limit) || POLL_PAGE_SIZE}`;
+
+    const { body } = await sfRequest(
+      session, `/query/?q=${encodeURIComponent(soql)}`,
+    );
+
+    const records = Array.isArray(body?.records) ? body.records.slice().reverse() : [];
+
+    if (records.length >= (Number(limit) || POLL_PAGE_SIZE)) {
+      logger.log("[conversation] poll window saturated; older rep messages may be skipped", {
+        sessionId,
+        conversationId: conversation.id,
+        returned: records.length,
+      });
+    }
+
+    let messages = records.map((record) => ({
+      id: record.Id,
+      body: record.Body__c ?? "",
+      sentAt: sentAtOf(record),
+    }));
+
+    // Exact cursor, at full millisecond precision, applied to the widened
+    // window the SOQL returned.
+    if (cursor.afterMs) {
+      messages = messages.filter((m) => {
+        const ms = m.sentAt ? Date.parse(m.sentAt) : NaN;
+        // An untimestamped message cannot be ruled out by the cursor, so it is
+        // delivered: a duplicate beats a lost rep reply.
+        return Number.isNaN(ms) || ms > cursor.afterMs;
+      });
+    } else if (cursor.afterId) {
+      const seen = messages.findIndex((m) => m.id === cursor.afterId);
+      // Not in the window: the widget is further behind than the page covers,
+      // so hand back what there is rather than nothing.
+      if (seen !== -1) messages = messages.slice(seen + 1);
+    }
+
+    // Sent_At__c ordering per the contract, with the CreatedDate fallback
+    // standing in for a null so an unstamped message still lands in sequence.
+    messages.sort((a, b) => {
+      const at = a.sentAt ? Date.parse(a.sentAt) : 0;
+      const bt = b.sentAt ? Date.parse(b.sentAt) : 0;
+      return at - bt;
+    });
+
+    if (messages.length) {
+      logger.log("[conversation] poll returning rep messages", {
+        sessionId,
+        conversationId: conversation.id,
+        count: messages.length,
+        basis: author.basis,
+      });
+    }
+
+    return { ...base, messages };
+  } catch (error) {
+    logger.error(
+      `[conversation] poll failed session=${sessionId}: ` +
+      `${error && error.message ? error.message : error}`,
+    );
+    // The widget retries on its next tick; an outage must never surface as a
+    // 500 to a page that is polling every few seconds.
+    return { messages: [], live: false, status: null, error: true };
+  }
+}
+
 export {
   ensureConversation,
+  pollRepMessages,
+  parsePollCursor,
+  POLL_PAGE_SIZE,
   authSession,
   transcriptEntries,
   findConversation,

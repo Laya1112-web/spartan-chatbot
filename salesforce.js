@@ -132,6 +132,10 @@ async function getSfToken({ now = Date.now, force = false } = {}) {
     return {
       access_token: tokenCache.access_token,
       instance_url: tokenCache.instance_url,
+      // Carried through the cache because the poll path identifies the bot's
+      // own messages by their author (see integrationUserId): a cache hit that
+      // dropped this would leave the poll unable to tell rep from bot.
+      id: tokenCache.id,
     };
   }
 
@@ -191,10 +195,42 @@ async function getSfToken({ now = Date.now, force = false } = {}) {
   tokenCache = {
     access_token: auth.access_token,
     instance_url: auth.instance_url,
+    // Identity URL, .../id/<orgId>/<userId>. Absent from some mocked token
+    // responses, which integrationUserId handles as "unknown".
+    id: auth.id,
     expiresAt: requestedAt + JWT_TTL_SECONDS * 1000 - TOKEN_REFRESH_MARGIN_MS,
   };
 
   return auth;
+}
+
+/**
+ * The Salesforce user id this Lambda authenticates as.
+ *
+ * Every Message__c this project writes -- the visitor's turns and the bot's
+ * replies alike -- is authored by the integration user, so CreatedById is what
+ * separates "the bot said this" from "a rep said this" without adding a field
+ * to Message__c. The poll path in conversation.js is the consumer.
+ *
+ * The id arrives free with the JWT auth: the token response carries an identity
+ * URL of the form https://login.salesforce.com/id/<orgId>/<userId>, whose last
+ * segment is the user. SF_INTEGRATION_USER_ID overrides it for an org where
+ * that URL is unavailable or the messages are written by a different user.
+ *
+ * @returns {string|null} null when it cannot be determined, which callers must
+ *   treat as "cannot tell rep from bot" rather than as "no bot".
+ */
+const SF_USER_ID_RE = /^005[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$/;
+
+function integrationUserId(auth) {
+  const override = process.env.SF_INTEGRATION_USER_ID;
+  if (typeof override === 'string' && SF_USER_ID_RE.test(override.trim())) {
+    return override.trim();
+  }
+
+  const identity = auth && typeof auth.id === 'string' ? auth.id : '';
+  const userId = identity.split('/').filter(Boolean).pop() || '';
+  return SF_USER_ID_RE.test(userId) ? userId : null;
 }
 
 /**
@@ -441,6 +477,7 @@ export {
   // Connected App and integration user.
   getSfToken,
   invalidateSfToken,
+  integrationUserId,
   TOKEN_REFRESH_MARGIN_MS,
   JWT_TTL_SECONDS,
   // Exported for tests / inspection only.

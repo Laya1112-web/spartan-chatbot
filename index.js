@@ -7,6 +7,14 @@
  *        -> { reply, handoff, handoffFields, handoffContext, sessionId }
  *        -> { reply: null, live: true, ... }  when a rep has claimed the chat
  *
+ *   POST /  { action: "poll", sessionId, after? }
+ *        -> { messages: [{id, body, sentAt}], live, status, sessionId }
+ *
+ * The poll is the return path: a claimed conversation gets no bot reply, so the
+ * rep's answers reach the widget only by being fetched. It shares this
+ * function, this Function URL, and the token gate below; it never reaches
+ * Claude.
+ *
  * handoffContext round-trips the lead fields accumulated so far: this handler
  * strips SCG_LEAD from the reply it returns, so the blocks do not survive in
  * the transcript the widget echoes back. The widget sends the handoffContext it
@@ -21,7 +29,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
 import { shouldHandoff, detectHandoff, recoverContactFields } from "./intent.js";
 import { maybeCreateLead } from "./leadHandoff.js";
-import { resolveLiveMode, recordVisitorTurn } from "./conversation.js";
+import { resolveLiveMode, recordVisitorTurn, pollRepMessages } from "./conversation.js";
 
 const MODEL = "claude-sonnet-5";
 const MAX_TOKENS = 1024;
@@ -126,6 +134,13 @@ export const handler = async (event) => {
 
   try {
     const body = parseBody(event);
+
+    // The poll is answered here and returns: no transcript, no Claude, no lead
+    // logic. Checked before normalizeMessages, which a poll body would fail.
+    if (body.action === POLL_ACTION) {
+      return await handlePoll(body, headers);
+    }
+
     sessionId = normalizeSessionId(body.sessionId);
     const messages = normalizeMessages(body.messages);
     const incomingContext = parseHandoffContext(body.handoffContext);
@@ -375,6 +390,34 @@ export const handler = async (event) => {
     return json(500, headers, { error: GENERIC_ERROR, sessionId });
   }
 };
+
+/**
+ * The widget asking "has a rep said anything since <cursor>?".
+ *
+ * Unlike a chat turn, the sessionId is required rather than generated: a poll
+ * for a session that does not exist is meaningless, and minting one would hand
+ * the widget an eternally empty inbox instead of a diagnosable 400.
+ *
+ * pollRepMessages never throws, so the only failure that can reach the caller
+ * from here is that 400. A Salesforce outage comes back as
+ * `{ messages: [], live: false, error: true }` — a 200 the widget can simply
+ * poll past, which matters when the page behind it is calling every few
+ * seconds.
+ */
+const POLL_ACTION = "poll";
+
+async function handlePoll(body, headers) {
+  if (typeof body.sessionId !== "string" || !body.sessionId.trim()) {
+    throw new BadRequestError('`sessionId` is required for { action: "poll" }.');
+  }
+  const sessionId = body.sessionId.trim().slice(0, 128);
+
+  const after = typeof body.after === "string" ? body.after.slice(0, 64) : null;
+
+  const result = await pollRepMessages({ sessionId, after });
+
+  return json(200, headers, { ...result, sessionId });
+}
 
 function corsHeaders(origin) {
   const headers = {
