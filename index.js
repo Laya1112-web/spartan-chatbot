@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
-import { shouldHandoff, recoverContactFields } from "./intent.js";
+import { shouldHandoff, detectHandoff, recoverContactFields } from "./intent.js";
 import { maybeCreateLead } from "./leadHandoff.js";
 
 const MODEL = "claude-sonnet-5";
@@ -152,25 +152,11 @@ export const handler = async (event) => {
     const lead = parseLeadBlock(status.text);
     const reply = lead.text || EMPTY_REPLY_FALLBACK;
 
-    // Does a fundable visitor want to proceed? Separate from whether we have
-    // enough to write a lead, which the minimum gate below decides.
-    const wantsHandoff = shouldHandoff({
-      messages,
-      reply,
-      modelDeclined: status.declined,
-    });
-
     // Everything the conversation has reported, accumulated every turn — not
     // only on the turn a handoff fires — so the running set is always current
-    // and always goes back to the caller.
+    // and always goes back to the caller. Built before the handoff decision
+    // because the model-signalled path below is judged against it.
     const accumulated = accumulateLeadFields(messages, lead.fields, incomingContext);
-
-    if (wantsHandoff && Object.keys(lead.fields).length === 0) {
-      // The model handed off without reporting any fields — a prompt-tuning
-      // signal, so it is logged even when the fallback below rescues contact
-      // details.
-      console.warn("spartan-chatbot: handoff with no SCG_LEAD fields", { sessionId });
-    }
 
     // Narrow gap-fill: contact details only, and only ones nothing else has
     // reported, so it merges UNDER both the context and this turn's block.
@@ -191,6 +177,41 @@ export const handler = async (event) => {
           recovered: Object.keys(filled),
         });
       }
+    }
+
+    // The model's own signal that it finished collecting: it reported a block
+    // on THIS turn and what we hold clears the minimum. This is the path that
+    // rescues the qualified lead whose visitor closed with "thank you" or "no"
+    // — words no phrase list will ever match. shouldHandoff applies decline
+    // suppression ahead of it, so a declined business cannot come back this
+    // way, and the minimum keeps a thin block from becoming a junk lead.
+    const modelSignaledHandoff =
+      Object.keys(lead.fields).length > 0 && meetsLeadMinimum(accumulated);
+
+    // Does a fundable visitor want to proceed? Either the visitor asked, or the
+    // model finished. Separate from whether we have enough to write a lead,
+    // which the minimum gate below decides for both paths alike.
+    const wantsHandoff = shouldHandoff({
+      messages,
+      reply,
+      modelDeclined: status.declined,
+      modelSignaledHandoff,
+    });
+
+    if (wantsHandoff && Object.keys(lead.fields).length === 0) {
+      // Handed off without the model reporting anything this turn — a
+      // prompt-tuning signal, logged even when the context or the fallback
+      // rescues the fields.
+      console.warn("spartan-chatbot: handoff with no SCG_LEAD fields", { sessionId });
+    }
+
+    if (modelSignaledHandoff && !detectHandoff(messages)) {
+      // Worth seeing in CloudWatch: this is a lead the old visitor-phrase-only
+      // rule would have dropped on the floor.
+      console.log("spartan-chatbot: handoff signalled by the model, not the visitor", {
+        sessionId,
+        fields: Object.keys(accumulated),
+      });
     }
 
     // A declined business yields no lead fields, however much the transcript

@@ -10,10 +10,25 @@
  *      party that holds the excluded-industry list. It reports that per reply
  *      via a status tag (see `systemPrompt.js`), which `index.js` parses.
  *
- * `shouldHandoff` combines them: a handoff means "a fundable visitor wants to
- * proceed", never merely "the visitor typed the words talk to someone". A
- * business Spartan just turned away must never produce a lead, however the
- * visitor phrases the request.
+ * `shouldHandoff` combines them: a handoff means "a fundable visitor is ready
+ * to proceed". Two things can signal that readiness, and either is enough:
+ *
+ *   - the visitor's own words (`detectHandoff`), or
+ *   - the model finishing collection and reporting a full SCG_LEAD block,
+ *     passed in as `modelSignaledHandoff` by index.js.
+ *
+ * The second path exists because the first one silently dropped qualified
+ * leads: the model would gather every detail, announce the handoff and report a
+ * complete block, and if the visitor's closing words happened to be "thank you"
+ * or "no" the regex never matched and the lead was thrown away. The model's own
+ * completion is now evidence in its own right.
+ *
+ * What keeps that safe is the minimum gate in index.js, which both paths pass
+ * through: an over-eager model reporting a thin block still writes nothing.
+ *
+ * Decline suppression stays absolute and ahead of both paths. A business
+ * Spartan just turned away must never produce a lead — however the visitor
+ * phrases the request, and however complete a block the model emits.
  *
  * This module only decides *whether* a handoff was requested and *what* was
  * gathered. Delivering the handoff (CRM, email, Salesforce) is out of scope.
@@ -119,11 +134,16 @@ export function isDeclineReply(text) {
 }
 
 /**
- * The flag `index.js` actually returns: a fundable visitor wants to proceed.
+ * The flag `index.js` actually returns: a fundable visitor is ready to proceed.
  *
- * Suppressed when the model tagged this reply a decline, when this reply reads
- * as a decline, or when any earlier assistant turn declined — once a business
- * has been turned away, a later "but I want to talk to someone" must not
+ * Fires when the visitor's words ask for it OR when the model signalled that it
+ * finished collecting (`modelSignaledHandoff`). Either is sufficient; neither
+ * is required of the other.
+ *
+ * Suppressed — before either path is considered — when the model tagged this
+ * reply a decline, when this reply reads as a decline, or when any earlier
+ * assistant turn declined. Once a business has been turned away, neither a
+ * later "but I want to talk to someone" nor a model-emitted block may
  * resurrect it as a lead.
  *
  * A missing status tag means "not declined": the deterministic checks still
@@ -135,15 +155,24 @@ export function isDeclineReply(text) {
  *   ending with the visitor's latest message.
  * @param {string} [args.reply] The assistant's reply for this turn, tag stripped.
  * @param {boolean} [args.modelDeclined] Whether the model tagged this reply a decline.
+ * @param {boolean} [args.modelSignaledHandoff] Whether the model reported a
+ *   complete-enough SCG_LEAD block on this turn. index.js decides that, because
+ *   it is the side that parses the block and holds the minimum gate.
  * @returns {boolean}
  */
-export function shouldHandoff({ messages, reply = "", modelDeclined = false }) {
+export function shouldHandoff({
+  messages,
+  reply = "",
+  modelDeclined = false,
+  modelSignaledHandoff = false,
+}) {
+  // Decline wins over everything, including a fully populated block.
   if (modelDeclined) return false;
   if (isDeclineReply(reply)) return false;
   if (messages.some((m) => m.role === "assistant" && isDeclineReply(m.content))) {
     return false;
   }
-  return detectHandoff(messages);
+  return detectHandoff(messages) || modelSignaledHandoff;
 }
 
 const EMAIL_RE = /\b[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+\b/g;
