@@ -26,6 +26,30 @@ const SF_API_VERSION = 'v61.0';
 // matches the Python implementation.
 const JWT_TTL_SECONDS = 300;
 
+/**
+ * Warm-container access-token cache.
+ *
+ * Every Salesforce operation used to begin with a fresh JWT auth. That was
+ * tolerable when the only operation was a lead write on a handoff turn, but the
+ * conversation sync checks for a claimed conversation BEFORE Claude on every
+ * single turn, so the auth round-trip landed in the latency path of every
+ * message. Caching it in module scope means a warm container auths once and
+ * reuses the token; a cold container behaves exactly as before.
+ *
+ * Held for the JWT's own lifetime minus a margin, which is deliberately
+ * conservative — the Salesforce session outlives the assertion that opened it,
+ * so this refreshes well before anything can actually expire. Lambda gives no
+ * cross-container guarantees, so this is a latency optimisation only: every
+ * path still works with an empty cache.
+ */
+const TOKEN_REFRESH_MARGIN_MS = 60_000;
+let tokenCache = null;
+
+/** Drop the cached token. Called on a 401, when the token is no longer good. */
+function invalidateSfToken() {
+  tokenCache = null;
+}
+
 // Deadline for each outbound Salesforce call, so a slow or unresponsive
 // Salesforce can never hang a Lambda invocation and cost the visitor a reply
 // they had already earned.
@@ -101,7 +125,16 @@ function createJwt({ clientId, username, privateKeyPem, now = Math.floor(Date.no
  * Exchange the assertion for an access token.
  * @returns {Promise<{access_token: string, instance_url: string}>}
  */
-async function getSfToken() {
+async function getSfToken({ now = Date.now, force = false } = {}) {
+  const requestedAt = now();
+
+  if (!force && tokenCache && requestedAt < tokenCache.expiresAt) {
+    return {
+      access_token: tokenCache.access_token,
+      instance_url: tokenCache.instance_url,
+    };
+  }
+
   const { jwt } = createJwt({
     clientId: process.env.SF_CLIENT_ID,
     username: process.env.SF_USERNAME,
@@ -154,6 +187,13 @@ async function getSfToken() {
   if (!auth.access_token || !auth.instance_url) {
     throw new Error('Salesforce auth response missing access_token or instance_url.');
   }
+
+  tokenCache = {
+    access_token: auth.access_token,
+    instance_url: auth.instance_url,
+    expiresAt: requestedAt + JWT_TTL_SECONDS * 1000 - TOKEN_REFRESH_MARGIN_MS,
+  };
+
   return auth;
 }
 
@@ -397,6 +437,12 @@ async function createChatbotLead(fields) {
 
 export {
   createChatbotLead,
+  // Auth seam for conversation.js, which is a second consumer of the same
+  // Connected App and integration user.
+  getSfToken,
+  invalidateSfToken,
+  TOKEN_REFRESH_MARGIN_MS,
+  JWT_TTL_SECONDS,
   // Exported for tests / inspection only.
   buildLeadPayload,
   createJwt,

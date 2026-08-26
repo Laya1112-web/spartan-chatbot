@@ -590,8 +590,15 @@ async function main() {
           });
           const data = JSON.parse(res.body);
 
+          // More than one attempt now: conversation.js also talks to Salesforce
+          // (the pre-Claude live-mode check, and the post-lead transcript
+          // sync), each starting with its own token call. What matters here is
+          // that the LEAD path reached the network and that every attempt was
+          // aimed at Salesforce.
           check('SF timeout: the Salesforce call was actually attempted',
-            sfAttempts.length === 1 && sfAttempts[0].includes('login.salesforce.com'));
+            sfAttempts.length >= 1 &&
+            sfAttempts.some((u) => u.includes('login.salesforce.com')) &&
+            sfAttempts.every((u) => u.includes('salesforce.com')));
           check('SF timeout: handler still returns 200 with the visitor\'s reply',
             res.statusCode === 200 &&
             data.reply === 'Great — a specialist will be in touch.' &&

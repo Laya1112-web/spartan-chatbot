@@ -5,6 +5,7 @@
  *
  *   POST /  { messages: [{role, content}, ...], sessionId?, handoffContext? }
  *        -> { reply, handoff, handoffFields, handoffContext, sessionId }
+ *        -> { reply: null, live: true, ... }  when a rep has claimed the chat
  *
  * handoffContext round-trips the lead fields accumulated so far: this handler
  * strips SCG_LEAD from the reply it returns, so the blocks do not survive in
@@ -20,6 +21,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
 import { shouldHandoff, detectHandoff, recoverContactFields } from "./intent.js";
 import { maybeCreateLead } from "./leadHandoff.js";
+import { resolveLiveMode, recordVisitorTurn } from "./conversation.js";
 
 const MODEL = "claude-sonnet-5";
 const MAX_TOKENS = 1024;
@@ -127,6 +129,29 @@ export const handler = async (event) => {
     sessionId = normalizeSessionId(body.sessionId);
     const messages = normalizeMessages(body.messages);
     const incomingContext = parseHandoffContext(body.handoffContext);
+
+    // Has a rep taken this conversation? Checked before Claude, because a
+    // claimed conversation must not get a bot reply at all. Never throws: if
+    // Salesforce is unreachable the bot answers as usual, which is the safe
+    // direction — the alternative is a silent widget with nobody replying.
+    const liveCheck = await resolveLiveMode({ sessionId, messages });
+
+    if (liveCheck.live) {
+      // The visitor's message was recorded by resolveLiveMode; the rep replies
+      // in Salesforce. `reply: null` plus `live: true` tells the widget to
+      // render nothing from the bot and keep the thread open.
+      return json(200, headers, {
+        reply: null,
+        live: true,
+        handoff: false,
+        handoffFields: {},
+        // Echoed back untouched so a later bot turn resumes with what was
+        // already collected.
+        handoffContext: incomingContext,
+        sessionId,
+        ...(liveCheck.conversation && { conversationId: liveCheck.conversation.id }),
+      });
+    }
 
     const response = await getClient().messages.create({
       model: MODEL,
@@ -253,6 +278,21 @@ export const handler = async (event) => {
     // declined business nor cost the visitor their reply.
     const { leadId } = await maybeCreateLead({ handoff, handoffFields, sessionId });
 
+    // Mirror the visitor's turn into Salesforce. The conversation is created on
+    // the handoff turn, when a leadId first exists, and that turn backfills the
+    // transcript so a rep sees the whole thread. Reuses the token the live-mode
+    // check already obtained, so a synced turn costs one auth, not two. Never
+    // throws — a failure here loses the transcript, never the reply.
+    const { conversationId } = await recordVisitorTurn({
+      sessionId,
+      leadId,
+      messages,
+      // Written Outbound so a rep sees the bot's side of the exchange too.
+      botReply: reply,
+      conversation: liveCheck.conversation,
+      deps: { ...(liveCheck.auth && { auth: liveCheck.auth }) },
+    });
+
     return json(200, headers, {
       reply,
       handoff,
@@ -263,6 +303,7 @@ export const handler = async (event) => {
       sessionId,
       ...(handoffDeferred && { handoffDeferred: true }),
       ...(leadId && { leadId }),
+      ...(conversationId && { conversationId }),
     });
   } catch (error) {
     if (error instanceof BadRequestError) {
