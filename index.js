@@ -35,6 +35,42 @@ const GENERIC_ERROR = "Sorry — something went wrong on our end. Please try aga
 const EMPTY_REPLY_FALLBACK =
   "Sorry, I wasn't able to answer that. Would you like me to have a funding specialist reach out?";
 
+/**
+ * Shared-token gate for the public Function URL.
+ *
+ * This is NOT strong security. The token ships to the browser inside the chat
+ * widget's JavaScript, so it is visible to any determined user who opens
+ * devtools or reads the page source, and it can be replayed from anywhere.
+ * What it does buy: it stops casual/drive-by abuse and the bots that scrape a
+ * bare Function URL out of page source and POST straight at it.
+ *
+ * The real protection is CloudFront in front of the Function URL with WAF
+ * rate limiting; that is the follow-up when the S3/CloudFront migration
+ * lands. This gate is the interim measure that makes reopening the URL
+ * tolerable until then.
+ */
+const WIDGET_TOKEN_HEADER = "x-widget-token";
+
+/**
+ * True when the request may proceed.
+ *
+ * Fails OPEN when WIDGET_TOKEN is unset on the environment, so a missing env
+ * var can't lock the widget out before the token has been configured. That
+ * case is logged loudly rather than silently allowed.
+ */
+function widgetTokenAllows(event) {
+  const expected = process.env.WIDGET_TOKEN;
+
+  if (!expected) {
+    console.warn(
+      "spartan-chatbot: WIDGET_TOKEN is not set — widget token gate is DISABLED",
+    );
+    return true;
+  }
+
+  return getHeader(event, WIDGET_TOKEN_HEADER) === expected;
+}
+
 /** Thrown for anything the caller can fix; surfaces as a 400. */
 class BadRequestError extends Error {}
 
@@ -68,6 +104,15 @@ export const handler = async (event) => {
 
   if (method !== "POST") {
     return json(405, headers, { error: "Method not allowed. Use POST." });
+  }
+
+  // Token gate. Deliberately after the OPTIONS branch above: browsers don't
+  // send custom headers on a preflight, so requiring the token there would
+  // break CORS for every legitimate request. Runs before anything expensive —
+  // a rejected caller reaches neither Claude nor Salesforce.
+  if (!widgetTokenAllows(event)) {
+    console.warn("spartan-chatbot: rejected request with missing/invalid widget token");
+    return json(401, headers, { error: "Unauthorized." });
   }
 
   let sessionId;
@@ -188,7 +233,7 @@ function corsHeaders(origin) {
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     headers["Access-Control-Allow-Origin"] = origin;
     headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
-    headers["Access-Control-Allow-Headers"] = "Content-Type";
+    headers["Access-Control-Allow-Headers"] = "Content-Type, x-widget-token";
     headers["Access-Control-Max-Age"] = "86400";
   }
 
