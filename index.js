@@ -3,8 +3,13 @@
  * chat widget. Invoked through a Lambda Function URL (buffered, payload
  * format 2.0); there is no API Gateway in front of it.
  *
- *   POST /  { messages: [{role, content}, ...], sessionId? }
- *        -> { reply, handoff, handoffFields, sessionId }
+ *   POST /  { messages: [{role, content}, ...], sessionId?, handoffContext? }
+ *        -> { reply, handoff, handoffFields, handoffContext, sessionId }
+ *
+ * handoffContext round-trips the lead fields accumulated so far: this handler
+ * strips SCG_LEAD from the reply it returns, so the blocks do not survive in
+ * the transcript the widget echoes back. The widget sends the handoffContext it
+ * last received, and gets an updated one every turn.
  *
  * Runtime: nodejs20.x   Region: us-east-1
  */
@@ -121,6 +126,7 @@ export const handler = async (event) => {
     const body = parseBody(event);
     sessionId = normalizeSessionId(body.sessionId);
     const messages = normalizeMessages(body.messages);
+    const incomingContext = parseHandoffContext(body.handoffContext);
 
     const response = await getClient().messages.create({
       model: MODEL,
@@ -146,36 +152,66 @@ export const handler = async (event) => {
     const lead = parseLeadBlock(status.text);
     const reply = lead.text || EMPTY_REPLY_FALLBACK;
 
-    const handoff = shouldHandoff({
+    // Does a fundable visitor want to proceed? Separate from whether we have
+    // enough to write a lead, which the minimum gate below decides.
+    const wantsHandoff = shouldHandoff({
       messages,
       reply,
       modelDeclined: status.declined,
     });
-    let handoffFields = handoff ? lead.fields : {};
 
-    if (handoff && Object.keys(lead.fields).length === 0) {
+    // Everything the conversation has reported, accumulated every turn — not
+    // only on the turn a handoff fires — so the running set is always current
+    // and always goes back to the caller.
+    const accumulated = accumulateLeadFields(messages, lead.fields, incomingContext);
+
+    if (wantsHandoff && Object.keys(lead.fields).length === 0) {
       // The model handed off without reporting any fields — a prompt-tuning
       // signal, so it is logged even when the fallback below rescues contact
       // details.
       console.warn("spartan-chatbot: handoff with no SCG_LEAD fields", { sessionId });
     }
 
-    // Narrow gap-fill: contact details only, and only ones the model didn't
-    // report. Amounts are never recovered this way (see recoverContactFields).
-    if (handoff && (!handoffFields.email || !handoffFields.phone)) {
+    // Narrow gap-fill: contact details only, and only ones nothing else has
+    // reported, so it merges UNDER both the context and this turn's block.
+    // Amounts are never recovered this way (see recoverContactFields). Skipped
+    // on a declined turn: a business Spartan can't fund is not one whose
+    // contact details we harvest.
+    if (!status.declined && (!accumulated.email || !accumulated.phone)) {
       const recovered = recoverContactFields(messages);
       const filled = {};
       for (const key of ["email", "phone"]) {
-        // Whatever the model reported always wins; this only fills a gap.
-        if (!handoffFields[key] && recovered[key]) filled[key] = recovered[key];
+        // Anything already known always wins; this only fills a gap.
+        if (!accumulated[key] && recovered[key]) filled[key] = recovered[key];
       }
       if (Object.keys(filled).length > 0) {
-        handoffFields = { ...handoffFields, ...filled };
+        mergeLeadFields(accumulated, filled);
         console.log("spartan-chatbot: recovered contact fields missing from SCG_LEAD", {
           sessionId,
           recovered: Object.keys(filled),
         });
       }
+    }
+
+    // A declined business yields no lead fields, however much the transcript
+    // holds; the accumulation still round-trips so nothing is silently lost.
+    const handoffFields = wantsHandoff ? { ...accumulated } : {};
+
+    // The minimum gate. A handoff can fire on a turn where the conversation
+    // hasn't yielded a name and a way to reach them yet — an early "talk to a
+    // specialist", or a bare confirmation after the model already wrapped up.
+    // Writing a lead then produces a placeholder record, so suppress the write
+    // and let the bot keep collecting instead.
+    let handoff = wantsHandoff;
+    let handoffDeferred = false;
+    if (wantsHandoff && !meetsLeadMinimum(accumulated)) {
+      handoff = false;
+      handoffDeferred = true;
+      console.warn("spartan-chatbot: lead creation suppressed, minimum not met", {
+        sessionId,
+        have: Object.keys(accumulated),
+        missing: missingForLeadMinimum(accumulated),
+      });
     }
 
     if (handoff) {
@@ -200,7 +236,11 @@ export const handler = async (event) => {
       reply,
       handoff,
       handoffFields,
+      // Always echoed back, handoff or not, so the next turn starts from
+      // everything collected so far.
+      handoffContext: accumulated,
       sessionId,
+      ...(handoffDeferred && { handoffDeferred: true }),
       ...(leadId && { leadId }),
     });
   } catch (error) {
@@ -426,9 +466,121 @@ function parseLeadBlock(text) {
   return { text: stripped, fields };
 }
 
+/**
+ * Must mirror salesforce.js's LAST_NAME_FALLBACK. A lead whose only "name" is
+ * that placeholder is exactly the empty record this gate exists to prevent, so
+ * it must never satisfy the name requirement below.
+ */
+const LEAD_NAME_FALLBACK = "Chatbot Lead";
+
+/**
+ * Merge `incoming` into `target` in place. Later non-empty values fill gaps and
+ * update; an absent or blank value never clobbers something already known, so
+ * a later turn that reports less than an earlier one cannot erase it.
+ */
+function mergeLeadFields(target, incoming) {
+  for (const [key, value] of Object.entries(incoming ?? {})) {
+    if (Array.isArray(value)) {
+      if (value.length) target[key] = value;
+      continue;
+    }
+    if (typeof value === "string" && value.trim()) target[key] = value.trim();
+  }
+  return target;
+}
+
+/**
+ * Re-derive everything the conversation has reported, not just this turn.
+ *
+ * The handoff decision and the SCG_LEAD data come from two different parties on
+ * two different turns: intent.js decides from the visitor's words, the model
+ * emits the block when *it* considers the handoff done. When those turns don't
+ * line up, building the lead from the firing turn alone yields a partial or
+ * empty record. So walk the whole transcript oldest-first, merging every block
+ * found, and let this turn's block win last.
+ *
+ * The Lambda is stateless per request, which is why this re-derives from the
+ * incoming history rather than keeping state: the widget sends the full
+ * transcript every turn.
+ *
+ * Three sources, in ascending precedence: the handoffContext the caller echoed
+ * back from prior turns, any SCG_LEAD blocks still present in the transcript's
+ * assistant turns, and this turn's block. The history scan finds nothing when
+ * the caller echoes the stripped replies this handler returns — which is why
+ * handoffContext exists — but it costs nothing and is correct for any client
+ * that does preserve raw assistant text.
+ */
+function accumulateLeadFields(messages, currentFields, contextFields) {
+  // Fields carried in from prior turns are the base; anything reported since
+  // merges on top of them.
+  const accumulated = mergeLeadFields({}, contextFields);
+
+  for (const message of messages ?? []) {
+    if (message?.role !== "assistant" || typeof message.content !== "string") continue;
+    mergeLeadFields(accumulated, parseLeadBlock(message.content).fields);
+  }
+
+  // This turn's block is the freshest report, so it merges last and wins.
+  return mergeLeadFields(accumulated, currentFields);
+}
+
+/**
+ * The caller's echoed-back accumulation. This crosses the trust boundary — it
+ * arrives in the request body — so it goes through the same whitelist as a
+ * model-emitted block: known keys only, coerced to trimmed strings, length
+ * capped. A caller can therefore restate its own details (which it could
+ * already do by typing them) but cannot introduce fields Salesforce never
+ * agreed to receive. Anything absent or malformed is simply no context.
+ */
+function parseHandoffContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return sanitizeLeadFields(value);
+}
+
+const LEAD_MINIMUM_CONTACT_KEYS = ["email", "phone"];
+
+function hasRealName(fields) {
+  return ["firstName", "lastName"].some((key) => {
+    const value = fields[key];
+    return typeof value === "string" && value.trim() && value.trim() !== LEAD_NAME_FALLBACK;
+  });
+}
+
+function hasContact(fields) {
+  return LEAD_MINIMUM_CONTACT_KEYS.some(
+    (key) => typeof fields[key] === "string" && fields[key].trim(),
+  );
+}
+
+/**
+ * The floor for writing a lead: a real name plus at least one way to reach
+ * them. Below this, Salesforce would store a placeholder record ("Chatbot
+ * Lead" / "Unknown (Chatbot Lead)") that nobody can action — worse than no
+ * record, because it looks like a lead.
+ */
+function meetsLeadMinimum(fields) {
+  return hasRealName(fields) && hasContact(fields);
+}
+
+/** What the minimum is missing, for the suppression log. */
+function missingForLeadMinimum(fields) {
+  const missing = [];
+  if (!hasRealName(fields)) missing.push("name");
+  if (!hasContact(fields)) missing.push("email-or-phone");
+  return missing;
+}
+
 function json(statusCode, headers, payload) {
   return { statusCode, headers, body: JSON.stringify(payload) };
 }
 
 // Exported for tests only; the Lambda entry point is `handler`.
-export { parseStatusTag, parseLeadBlock };
+export {
+  parseStatusTag,
+  parseLeadBlock,
+  parseHandoffContext,
+  mergeLeadFields,
+  accumulateLeadFields,
+  meetsLeadMinimum,
+  missingForLeadMinimum,
+};

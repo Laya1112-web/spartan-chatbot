@@ -399,14 +399,34 @@ async function main() {
 
     try {
       {
+        // Name but no email or phone: the minimum gate now defers the write
+        // rather than creating a contactless placeholder lead. The parsed
+        // fields still come back so the next turn can build on them.
         const { statusCode, data } = await invoke(
           'Great — a specialist will reach out.\n[[SCG_STATUS: OK]]\n' +
           '[[SCG_LEAD: {"firstName":"Dana","lastName":"Whitfield","monthlyRevenue":"$50,000/month","fundingAmount":"$75,000"}]]',
           wantsSpecialist);
-        check('handler: handoff turn -> 200, fields from the block, tags stripped',
-          statusCode === 200 && data.handoff === true &&
+        check('handler: name but no contact -> fields parsed, tags stripped',
+          statusCode === 200 &&
           data.handoffFields.fundingAmount === '$75,000' &&
           data.handoffFields.monthlyRevenue === '$50,000/month' &&
+          !/SCG_/i.test(data.reply));
+        check('handler: name but no contact -> handoff deferred, no lead written',
+          data.handoff === false && data.handoffDeferred === true &&
+          !('leadId' in data));
+      }
+
+      {
+        // Same turn plus a phone number clears the minimum and hands off.
+        const { statusCode, data } = await invoke(
+          'Great — a specialist will reach out.\n[[SCG_STATUS: OK]]\n' +
+          '[[SCG_LEAD: {"firstName":"Dana","lastName":"Whitfield","phone":"(216) 555-0142","fundingAmount":"$75,000"}]]',
+          wantsSpecialist);
+        check('handler: name + phone -> handoff turn, fields from the block, tags stripped',
+          statusCode === 200 && data.handoff === true &&
+          data.handoffDeferred === undefined &&
+          data.handoffFields.fundingAmount === '$75,000' &&
+          data.handoffFields.phone === '(216) 555-0142' &&
           !/SCG_/i.test(data.reply));
       }
 
@@ -426,9 +446,12 @@ async function main() {
           'Happy to help.\n[[SCG_STATUS: OK]]\n[[SCG_LEAD: {"firstName":"Dana", oops}]]',
           wantsSpecialist);
         check('handler: malformed block -> 200, no fields, clean reply, no crash',
-          statusCode === 200 && data.handoff === true &&
+          statusCode === 200 &&
           Object.keys(data.handoffFields).length === 0 &&
           data.reply === 'Happy to help.' && data.error === undefined);
+        check('handler: malformed block -> nothing collected, so no lead is written',
+          data.handoff === false && data.handoffDeferred === true &&
+          !('leadId' in data));
       }
       console.log('\nNARROW EMAIL+PHONE FALLBACK  -> fills gaps, never amounts\n');
 
@@ -600,7 +623,7 @@ async function main() {
 
   {
     check(`SF_FETCH_TIMEOUT_MS is a bounded named constant (${SF_FETCH_TIMEOUT_MS}ms)`,
-      SF_FETCH_TIMEOUT_MS === 4000);
+      SF_FETCH_TIMEOUT_MS === 8000);
   }
 
   {

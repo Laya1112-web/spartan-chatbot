@@ -37,7 +37,11 @@ const JWT_TTL_SECONDS = 300;
 // approach that ceiling. What this constant guarantees is that each call bails
 // at a known deadline instead of hanging indefinitely -- the unbounded hang is
 // the actual risk being closed. Tune here.
-const SF_FETCH_TIMEOUT_MS = 4000;
+// Two Salesforce calls per lead (JWT auth, then insert) at 8s each is 16s
+// worst case, which still fits the 30s Lambda budget alongside the Claude
+// call. 4s was too tight: a cold JWT auth plus insert overran it and the
+// write was lost even though every field had been collected.
+const SF_FETCH_TIMEOUT_MS = 8000;
 
 // Required-field fallbacks. Salesforce rejects a Lead insert without LastName,
 // and Company is required for a non-person-account Lead.
