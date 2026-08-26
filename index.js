@@ -129,6 +129,9 @@ export const handler = async (event) => {
     sessionId = normalizeSessionId(body.sessionId);
     const messages = normalizeMessages(body.messages);
     const incomingContext = parseHandoffContext(body.handoffContext);
+    // A lead this session already produced. Its presence means "do not insert
+    // another one", however many later turns look like a handoff.
+    const existingLeadId = parseContextLeadId(body.handoffContext);
 
     // Has a rep taken this conversation? Checked before Claude, because a
     // claimed conversation must not get a bot reply at all. Never throws: if
@@ -146,8 +149,11 @@ export const handler = async (event) => {
         handoff: false,
         handoffFields: {},
         // Echoed back untouched so a later bot turn resumes with what was
-        // already collected.
-        handoffContext: incomingContext,
+        // already collected, the once-per-session lead guard included.
+        handoffContext: {
+          ...incomingContext,
+          ...(existingLeadId && { leadId: existingLeadId }),
+        },
         sessionId,
         ...(liveCheck.conversation && { conversationId: liveCheck.conversation.id }),
       });
@@ -276,7 +282,49 @@ export const handler = async (event) => {
     // field set. maybeCreateLead is gated on handoff === true and swallows
     // every Salesforce failure, so this can neither create a lead for a
     // declined business nor cost the visitor their reply.
-    const { leadId } = await maybeCreateLead({ handoff, handoffFields, sessionId });
+    // ONE lead per session.
+    //
+    // The handoff trigger fires per turn, and the model happily re-reports a
+    // complete block on every wrap-up-ish turn after the first, so an unguarded
+    // create inserts a fresh Lead on each of them. Salesforce will not stop it:
+    // the insert sends allowSave=true, so duplicate rules permit the save and
+    // the DUPLICATES_DETECTED fallback never runs.
+    //
+    // Primary guard is the leadId echoed back in handoffContext. The secondary
+    // is an existing Conversation__c for this session, which only comes into
+    // being on a handoff turn and so implies a lead already exists — that one
+    // covers a client that drops the context, and the window where two turns
+    // arrive before the context round-trips.
+    // Three guards, in descending order of authority. Each is independently
+    // sufficient; together they cover the ways the others can be unavailable.
+    const memoryKeys = leadMemoryKeys(sessionId, accumulated);
+    let leadId = existingLeadId;
+    let guardedBy = existingLeadId ? "handoffContext" : null;
+
+    if (!guardedBy && liveCheck.conversation) {
+      guardedBy = "conversation";
+    }
+
+    if (!guardedBy) {
+      const remembered = recallLead(memoryKeys);
+      if (remembered) {
+        leadId = remembered.leadId;
+        guardedBy = `warm-memory(${remembered.key.slice(0, 2)})`;
+      }
+    }
+
+    if (guardedBy) {
+      if (wantsHandoff) {
+        console.log("spartan-chatbot: lead already created for this session, not creating another", {
+          sessionId,
+          guard: guardedBy,
+          leadId: leadId ?? "(unknown, conversation-guarded)",
+        });
+      }
+    } else {
+      ({ leadId } = await maybeCreateLead({ handoff, handoffFields, sessionId }));
+      if (leadId) rememberLead(memoryKeys, leadId);
+    }
 
     // Mirror the visitor's turn into Salesforce. The conversation is created on
     // the handoff turn, when a leadId first exists, and that turn backfills the
@@ -298,8 +346,12 @@ export const handler = async (event) => {
       handoff,
       handoffFields,
       // Always echoed back, handoff or not, so the next turn starts from
-      // everything collected so far.
-      handoffContext: accumulated,
+      // everything collected so far — and, once a lead exists, from the guard
+      // that stops a second one being inserted.
+      handoffContext: {
+        ...accumulated,
+        ...(leadId && { leadId }),
+      },
       sessionId,
       ...(handoffDeferred && { handoffDeferred: true }),
       ...(leadId && { leadId }),
@@ -587,6 +639,91 @@ function accumulateLeadFields(messages, currentFields, contextFields) {
 }
 
 /**
+ * Warm-container record of leads already created, the third and last
+ * once-per-session guard.
+ *
+ * The other two both depend on something outside this Lambda: the primary needs
+ * the caller to echo handoffContext back, the secondary needs Conversation__c to
+ * exist in Salesforce. This one needs nothing, so it works the moment it
+ * deploys — at the cost of being best-effort, since a cold container starts
+ * empty and concurrent containers do not share it.
+ *
+ * Keyed by session AND by contact details on purpose. A session key alone is
+ * useless against a caller that mints a fresh sessionId per turn, which is
+ * exactly what the current widget does, so the email/phone fingerprint is what
+ * actually stops the duplicates today. Two different people sharing an email or
+ * phone inside one warm container would collapse to one lead, which is the
+ * right answer anyway.
+ *
+ * Bounded, because a long-lived container would otherwise grow this forever.
+ * Insertion-ordered Map, so eviction is FIFO.
+ */
+const LEAD_MEMORY_MAX = 500;
+const leadMemory = new Map();
+
+/** Every key this turn's identity could be remembered under. */
+function leadMemoryKeys(sessionId, fields = {}) {
+  const keys = [];
+  if (sessionId) keys.push(`s:${sessionId}`);
+
+  const email = typeof fields.email === "string" ? fields.email.trim().toLowerCase() : "";
+  if (email) keys.push(`e:${email}`);
+
+  const digits = typeof fields.phone === "string" ? fields.phone.replace(/\D/g, "") : "";
+  // Last ten digits, so "+1 (212) 555-0188" and "2125550188" agree.
+  if (digits.length >= 10) keys.push(`p:${digits.slice(-10)}`);
+
+  return keys;
+}
+
+function recallLead(keys) {
+  for (const key of keys) {
+    const leadId = leadMemory.get(key);
+    if (leadId) return { leadId, key };
+  }
+  return null;
+}
+
+function rememberLead(keys, leadId) {
+  for (const key of keys) {
+    // Re-insert so recently used keys sit at the young end of the FIFO.
+    leadMemory.delete(key);
+    leadMemory.set(key, leadId);
+  }
+  while (leadMemory.size > LEAD_MEMORY_MAX) {
+    leadMemory.delete(leadMemory.keys().next().value);
+  }
+}
+
+/** Exported so tests can simulate a cold container. */
+function clearLeadMemory() {
+  leadMemory.clear();
+}
+
+/**
+ * Salesforce Lead ids: the Lead key prefix plus 12 more characters, or the
+ * 18-character case-safe form.
+ */
+const LEAD_ID_RE = /^00Q[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$/;
+
+/**
+ * The id of the Lead already created for this session, if the caller echoed one
+ * back. This is the primary once-per-session guard.
+ *
+ * Deliberately kept OUT of the lead field set: it is a control flag, never a
+ * value to write to Salesforce. Shape-validated because it arrives from the
+ * browser — a caller can at worst suppress its own lead (it could equally just
+ * not send the message), but it must never reach a write as a field value.
+ */
+function parseContextLeadId(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value.leadId;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return LEAD_ID_RE.test(trimmed) ? trimmed : null;
+}
+
+/**
  * The caller's echoed-back accumulation. This crosses the trust boundary — it
  * arrives in the request body — so it goes through the same whitelist as a
  * model-emitted block: known keys only, coerced to trimmed strings, length
@@ -641,6 +778,10 @@ export {
   parseStatusTag,
   parseLeadBlock,
   parseHandoffContext,
+  parseContextLeadId,
+  leadMemoryKeys,
+  clearLeadMemory,
+  LEAD_MEMORY_MAX,
   mergeLeadFields,
   accumulateLeadFields,
   meetsLeadMinimum,

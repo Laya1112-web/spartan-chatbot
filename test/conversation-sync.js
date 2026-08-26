@@ -523,7 +523,53 @@ async function main() {
       gets === 2 && threw !== null && threw.sfStatus === 401);
   }
 
-  line("8. isClaimed  -> only 'Claimed' silences the bot");
+  line("8. SECONDARY LEAD GUARD  -> an existing conversation also blocks a create");
+
+  {
+    // A conversation only comes into being on a handoff turn, so its existence
+    // implies a lead already exists. This covers a client that drops
+    // handoffContext, and the window before the context round-trips.
+    let leadWrites = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url), method = init.method || "GET";
+      if (u.includes("anthropic.com")) {
+        return json({ id: "m", type: "message", role: "assistant", model: "claude-sonnet-5",
+          content: [{ type: "text", text: "All set.\n[[SCG_STATUS: OK]]\n" +
+            '[[SCG_LEAD: {"firstName":"Dana","lastName":"Whitfield","phone":"(216) 555-0142"}]]' }],
+          stop_reason: "end_turn", stop_details: null, usage: { input_tokens: 1, output_tokens: 1 } });
+      }
+      if (u.includes("oauth2/token")) return json({ access_token: "T", instance_url: "https://example.my.salesforce.com" });
+      if (u.includes("/sobjects/Lead")) { leadWrites++; return json({ id: "00QNEWLEAD00000000" }, 201); }
+      if (u.includes("/Session_Id__c/") && method === "GET") return json({ Id: "a01CONVEXISTS", Status__c: "New" });
+      if (u.includes("/sobjects/Message__c/")) return json({ id: "a02MSG" }, 201);
+      return noBody(204);
+    };
+    const rl = console.log, rw = console.warn, re = console.error;
+    const captured = [];
+    console.log = console.warn = console.error = (...a) =>
+      captured.push(a.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" "));
+    let data;
+    try {
+      const res = await handler({
+        requestContext: { http: { method: "POST" } },
+        headers: { origin: "https://www.spartancapital.us" },
+        body: JSON.stringify({
+          messages: [{ role: "user", content: "I want to talk to a funding specialist" }],
+          sessionId: "sess-existing-conv",
+        }),
+      });
+      data = JSON.parse(res.body);
+    } finally {
+      console.log = rl; console.warn = rw; console.error = re;
+    }
+    check("existing conversation, no context leadId -> NO Lead insert", leadWrites === 0);
+    check("existing conversation -> the skip is logged, attributed to that guard",
+      captured.some((l) => /not creating another/.test(l) && /conversation/.test(l)));
+    check("existing conversation -> messages still sync (per-message, not per-lead)",
+      data.conversationId === "a01CONVEXISTS");
+  }
+
+  line("9. isClaimed  -> only 'Claimed' silences the bot");
 
   check("isClaimed('Claimed') is true", conv.isClaimed("Claimed") === true);
   check("isClaimed('New'/'Closed'/null/undefined) are all false",
