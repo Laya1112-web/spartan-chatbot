@@ -350,10 +350,19 @@ async function main() {
           c.body?.Direction__c === "Outbound"));
     }
 
-    for (const status of ["New", "Closed"]) {
-      const { data } = await invokeHandler({ status });
-      check(`Status '${status}' -> the bot replies as normal`,
+    {
+      const { data } = await invokeHandler({ status: "New" });
+      check("Status 'New' -> the bot replies as normal",
         claudeCalls === 1 && data.live === undefined && data.reply === "Bot reply.");
+    }
+
+    // Closed used to land here as "not claimed, so the bot handles it". It no
+    // longer does: the chat is over. Full coverage of the transition, including
+    // the no-write guarantee, lives in test/live-mode-transitions.js.
+    {
+      const { data } = await invokeHandler({ status: "Closed" });
+      check("Status 'Closed' -> Claude was NOT called and no reply comes back",
+        claudeCalls === 0 && data.closed === true && data.reply === null);
     }
 
     {
@@ -569,12 +578,19 @@ async function main() {
       data.conversationId === "a01CONVEXISTS");
   }
 
-  line("9. isClaimed  -> only 'Claimed' silences the bot");
+  line("9. isClaimed / isClosed  -> two different silences, never the same one");
 
   check("isClaimed('Claimed') is true", conv.isClaimed("Claimed") === true);
   check("isClaimed('New'/'Closed'/null/undefined) are all false",
     [conv.isClaimed("New"), conv.isClaimed("Closed"), conv.isClaimed(null),
      conv.isClaimed(undefined), conv.isClaimed("claimed")].every((v) => v === false));
+
+  check("isClosed('Closed') is true", conv.isClosed("Closed") === true);
+  check("isClosed('New'/'Claimed'/null/undefined) are all false",
+    [conv.isClosed("New"), conv.isClosed("Claimed"), conv.isClosed(null),
+     conv.isClosed(undefined), conv.isClosed("closed")].every((v) => v === false));
+  check("no status is both claimed and closed",
+    !["New", "Claimed", "Closed", null].some((st) => conv.isClaimed(st) && conv.isClosed(st)));
 
   console.log(`\n${"=".repeat(72)}`);
   console.log(`CONVERSATION SYNC + LIVE MODE: ${passed} assertions passed, no network`);

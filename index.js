@@ -5,15 +5,24 @@
  *
  *   POST /  { messages: [{role, content}, ...], sessionId?, handoffContext? }
  *        -> { reply, handoff, handoffFields, handoffContext, sessionId }
- *        -> { reply: null, live: true, ... }  when a rep has claimed the chat
+ *        -> { reply: null, live: true, ... }    a rep has claimed the chat
+ *        -> { reply: null, closed: true, ... }  the chat is over
  *
  *   POST /  { action: "poll", sessionId, after? }
- *        -> { messages: [{id, body, sentAt}], live, status, sessionId }
+ *        -> { messages: [{id, body, sentAt}], live, closed, status, sessionId }
+ *
+ *   POST /  { action: "close", sessionId }
+ *        -> { closed, reply: null, live: false, status, sessionId }
  *
  * The poll is the return path: a claimed conversation gets no bot reply, so the
  * rep's answers reach the widget only by being fetched. It shares this
  * function, this Function URL, and the token gate below; it never reaches
- * Claude.
+ * Claude. `close` is the End Chat button, and is terminal — a closed
+ * conversation gets no further bot replies and no further writes.
+ *
+ * The three live-mode states the widget has to render are Claimed (a rep is
+ * answering), New (the bot is answering — including a conversation a rep handed
+ * back), and Closed (nobody is; the thread is finished).
  *
  * handoffContext round-trips the lead fields accumulated so far: this handler
  * strips SCG_LEAD from the reply it returns, so the blocks do not survive in
@@ -29,7 +38,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
 import { shouldHandoff, detectHandoff, recoverContactFields } from "./intent.js";
 import { maybeCreateLead } from "./leadHandoff.js";
-import { resolveLiveMode, recordVisitorTurn, pollRepMessages } from "./conversation.js";
+import {
+  resolveLiveMode,
+  recordVisitorTurn,
+  pollRepMessages,
+  closeConversation,
+  STATUS_CLOSED,
+} from "./conversation.js";
 
 const MODEL = "claude-sonnet-5";
 const MAX_TOKENS = 1024;
@@ -141,6 +156,12 @@ export const handler = async (event) => {
       return await handlePoll(body, headers);
     }
 
+    // Same for the End Chat button: a status write and nothing else. It carries
+    // no transcript either, so it also has to precede normalizeMessages.
+    if (body.action === CLOSE_ACTION) {
+      return await handleClose(body, headers);
+    }
+
     sessionId = normalizeSessionId(body.sessionId);
     const messages = normalizeMessages(body.messages);
     const incomingContext = parseHandoffContext(body.handoffContext);
@@ -153,6 +174,28 @@ export const handler = async (event) => {
     // Salesforce is unreachable the bot answers as usual, which is the safe
     // direction — the alternative is a silent widget with nobody replying.
     const liveCheck = await resolveLiveMode({ sessionId, messages });
+
+    // The visitor ended this chat. Terminal: no reply, and nothing recorded
+    // against a finished transcript. Checked before `live` because a closed
+    // conversation is over regardless of who held it last.
+    if (liveCheck.closed) {
+      return json(200, headers, {
+        reply: null,
+        closed: true,
+        live: false,
+        handoff: false,
+        handoffFields: {},
+        // Still echoed back: the widget may keep the closed thread on screen,
+        // and the lead guard must survive if the visitor starts a new session
+        // with this context in hand.
+        handoffContext: {
+          ...incomingContext,
+          ...(existingLeadId && { leadId: existingLeadId }),
+        },
+        sessionId,
+        ...(liveCheck.conversation && { conversationId: liveCheck.conversation.id }),
+      });
+    }
 
     if (liveCheck.live) {
       // The visitor's message was recorded by resolveLiveMode; the rep replies
@@ -417,6 +460,43 @@ async function handlePoll(body, headers) {
   const result = await pollRepMessages({ sessionId, after });
 
   return json(200, headers, { ...result, sessionId });
+}
+
+/**
+ * The widget's End Chat button: mark the conversation Closed and stop.
+ *
+ * Mirrors handlePoll's contract deliberately. The sessionId is required rather
+ * than minted, because closing a session nobody named is meaningless. And
+ * closeConversation never throws, so a Salesforce outage comes back as a 200
+ * carrying `closed: false, error: true` rather than a 500 — the visitor is on
+ * their way out of the chat and must not be shown an error to leave.
+ *
+ * `reply: null` and `live: false` are included so the shape matches the chat
+ * turn's closed response and the widget can take one branch for both.
+ */
+const CLOSE_ACTION = "close";
+
+async function handleClose(body, headers) {
+  if (typeof body.sessionId !== "string" || !body.sessionId.trim()) {
+    throw new BadRequestError('`sessionId` is required for { action: "close" }.');
+  }
+  const sessionId = body.sessionId.trim().slice(0, 128);
+
+  const result = await closeConversation({ sessionId });
+
+  return json(200, headers, {
+    closed: result.closed,
+    reply: null,
+    live: false,
+    status: result.closed ? STATUS_CLOSED : null,
+    sessionId,
+    ...(result.conversationId && { conversationId: result.conversationId }),
+    // Nothing existed to close: the conversation is only created at handoff, so
+    // a visitor who never asked for a human hits this. Not an error.
+    ...(result.notFound && { notFound: true }),
+    ...(result.alreadyClosed && { alreadyClosed: true }),
+    ...(result.error && { error: true }),
+  });
 }
 
 function corsHeaders(origin) {

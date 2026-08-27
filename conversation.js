@@ -44,11 +44,29 @@ const MAX_BODY_CHARS = 30000;
 
 /**
  * A rep has taken the conversation, so the bot must stay silent for this turn.
- * Closed deliberately reads as "not claimed": a closed conversation falls back
- * to bot handling rather than leaving the visitor talking to nobody.
+ *
+ * Only 'Claimed' means live. 'Closed' is NOT claimed and never has been — it is
+ * handled separately by isClosed, because the two silences are different: a
+ * claimed conversation is waiting on a rep, a closed one is over.
  */
 function isClaimed(status) {
   return status === STATUS_CLAIMED;
+}
+
+/**
+ * The conversation is over — the visitor pressed End Chat (or a rep closed it).
+ *
+ * Terminal, and deliberately so. The bot does not reply, does not resume, and
+ * nothing further is written to the record: see resolveLiveMode, which
+ * short-circuits on it, and recordVisitorTurn, which refuses to append. The
+ * only way back is a rep reopening it in Salesforce.
+ *
+ * Treating Closed as "not claimed, therefore bot handles it" — which is what
+ * this module used to do — meant a visitor who ended the chat got a bot reply
+ * to their goodbye and a reopened thread nobody was watching.
+ */
+function isClosed(status) {
+  return status === STATUS_CLOSED;
 }
 
 /** Salesforce is only wired up when both the key and the client id are present. */
@@ -283,18 +301,37 @@ function lastVisitorMessage(messages) {
 }
 
 /**
- * Called BEFORE Claude, on every turn: is a rep handling this conversation?
+ * Called BEFORE Claude, on every turn: who — if anyone — is handling this
+ * conversation, and is it still open at all?
  *
- * When the answer is yes the visitor's message is recorded here, because the
- * caller returns immediately afterwards without reaching the normal sync path.
+ * Three outcomes, and the caller behaves differently for each:
+ *
+ *   live: true    'Claimed'. A rep owns the thread, so the bot stays silent.
+ *                 The visitor's message IS recorded here, because the caller
+ *                 returns immediately without reaching the normal sync path.
+ *   closed: true  'Closed'. The chat is over. The bot stays silent AND nothing
+ *                 is written — see isClosed for why this is terminal. The
+ *                 visitor's message is deliberately dropped rather than
+ *                 appended to a finished transcript.
+ *   neither       'New', or no conversation yet. The bot answers normally.
+ *
+ * That third case is also the rep-hands-back path: a conversation a rep set
+ * from 'Claimed' to 'New' lands here with no special handling, so the bot
+ * resumes on the very next turn. It picks the thread up from the transcript the
+ * widget sends, and because the conversation already exists the caller appends
+ * to it rather than backfilling a second copy.
  *
  * Never throws. A failure here means the bot answers as usual — the safe
- * direction, since the alternative is a silent widget with nobody replying.
+ * direction, since the alternative is a silent widget with nobody replying. The
+ * one cost of that choice is that a Salesforce outage cannot detect a Closed
+ * conversation either; recordVisitorTurn re-checks before it writes, so an
+ * outage still cannot append to a closed record.
  *
- * @returns {Promise<{live: boolean, conversation: object|null, auth: object|null}>}
+ * @returns {Promise<{live: boolean, closed: boolean, conversation: object|null,
+ *   auth: object|null}>}
  */
 async function resolveLiveMode({ sessionId, messages, logger = console, deps = {} }) {
-  const result = { live: false, conversation: null, auth: null };
+  const result = { live: false, closed: false, conversation: null, auth: null };
   if (!sessionId || !isSalesforceConfigured()) return result;
 
   try {
@@ -306,6 +343,18 @@ async function resolveLiveMode({ sessionId, messages, logger = console, deps = {
     if (!conversation) return result;
 
     result.conversation = conversation;
+
+    // Checked before Claimed: a closed conversation is over regardless of who
+    // held it last, and unlike the Claimed branch it takes no write at all.
+    if (isClosed(conversation.status)) {
+      result.closed = true;
+      logger.log("spartan-chatbot: conversation is closed, bot staying silent", {
+        sessionId,
+        conversationId: conversation.id,
+      });
+      return result;
+    }
+
     if (!isClaimed(conversation.status)) return result;
 
     result.live = true;
@@ -325,7 +374,7 @@ async function resolveLiveMode({ sessionId, messages, logger = console, deps = {
       `[conversation] live-mode check failed session=${sessionId}: ` +
       `${error && error.message ? error.message : error}`,
     );
-    return { live: false, conversation: null, auth: result.auth };
+    return { live: false, closed: false, conversation: null, auth: result.auth };
   }
 }
 
@@ -342,11 +391,12 @@ async function resolveLiveMode({ sessionId, messages, logger = console, deps = {
  * moment. Later turns write just the newest exchange.
  *
  * Nothing is written for a live turn: `botReply` is null there and the rep, not
- * the bot, is speaking.
+ * the bot, is speaking. Nothing is written for a closed one either, whatever
+ * the caller passes — see the isClosed guard below.
  *
  * Never throws.
  *
- * @returns {Promise<{conversationId?: string, written: number}>}
+ * @returns {Promise<{conversationId?: string, written: number, closed?: true}>}
  */
 async function recordVisitorTurn({
   sessionId, leadId, messages, botReply = null,
@@ -371,6 +421,19 @@ async function recordVisitorTurn({
         `[conversation] session=${sessionId} conversation=${conv.id}` +
         `${created ? " (created)" : " (existing)"}`,
       );
+    }
+
+    // Never append to a finished conversation. The handler already returns
+    // early on a closed conversation, so reaching this with one means the
+    // live-mode check could not see Salesforce (an outage, a timeout) and the
+    // bot answered on the safe default. This is the second line of defence:
+    // ensureConversation re-read the record, so the status here is fresh.
+    if (isClosed(conv.status)) {
+      logger.log(
+        `[conversation] session=${sessionId} conversation=${conv.id} is closed; ` +
+        "not writing messages",
+      );
+      return { conversationId: conv.id, written: 0, closed: true };
     }
 
     // A freshly created conversation gets the whole transcript, in order and in
@@ -409,6 +472,60 @@ async function recordVisitorTurn({
       `${error && error.message ? error.message : error}`,
     );
     return { written: 0 };
+  }
+}
+
+/**
+ * Mark this session's conversation Closed — the widget's End Chat button.
+ *
+ * Idempotent: a conversation that is already Closed reports success without a
+ * write, so a double-tapped button costs one read and nothing else. A 'Claimed'
+ * conversation closes too — a visitor ending the chat outranks a rep holding
+ * it, and the rep sees the status change in Salesforce.
+ *
+ * A session with no conversation is NOT an error. The conversation is only
+ * created at handoff, so a visitor who never asked for a human has nothing to
+ * close; the widget ends the chat on its own side either way.
+ *
+ * Never throws, like every other orchestrator here. The worst case of a failed
+ * close is a conversation left open in Salesforce for a rep to tidy up, which
+ * is a great deal better than an error in the visitor's face on their way out.
+ *
+ * @returns {Promise<{closed: boolean, conversationId?: string,
+ *   alreadyClosed?: true, notFound?: true, error?: true}>}
+ */
+async function closeConversation({ sessionId, logger = console, deps = {} }) {
+  if (!sessionId || !isSalesforceConfigured()) return { closed: false };
+
+  try {
+    const session = toSession(deps.auth || null, deps);
+    const conversation = await (deps.findConversation || findConversation)(sessionId, session);
+
+    if (!conversation) {
+      logger.log(`[conversation] close: nothing to close for session=${sessionId}`);
+      return { closed: false, notFound: true };
+    }
+
+    if (isClosed(conversation.status)) {
+      return { closed: true, conversationId: conversation.id, alreadyClosed: true };
+    }
+
+    await sfRequest(session, `/sobjects/${CONVERSATION_OBJECT}/${conversation.id}`, {
+      method: "PATCH",
+      body: { Status__c: STATUS_CLOSED },
+    });
+
+    logger.log(
+      `[conversation] closed session=${sessionId} conversation=${conversation.id} ` +
+      `(was ${conversation.status ?? "unset"})`,
+    );
+    return { closed: true, conversationId: conversation.id };
+  } catch (error) {
+    logger.error(
+      `[conversation] close failed session=${sessionId}: ` +
+      `${error && error.message ? error.message : error}`,
+    );
+    return { closed: false, error: true };
   }
 }
 
@@ -530,12 +647,13 @@ function repAuthorFilter(conversation, auth, logger) {
  * the widget simply polls again.
  *
  * @returns {Promise<{messages: Array<{id: string, body: string, sentAt: string|null}>,
- *   live: boolean, status: string|null, conversationId?: string, error?: true}>}
+ *   live: boolean, closed: boolean, status: string|null, conversationId?: string,
+ *   error?: true}>}
  */
 async function pollRepMessages({
   sessionId, after = null, limit = POLL_PAGE_SIZE, logger = console, deps = {},
 }) {
-  const empty = { messages: [], live: false, status: null };
+  const empty = { messages: [], live: false, closed: false, status: null };
   if (!sessionId || !isSalesforceConfigured()) return empty;
 
   try {
@@ -549,6 +667,11 @@ async function pollRepMessages({
     const base = {
       messages: [],
       live: isClaimed(conversation.status),
+      // The widget's other channel onto the same fact: a chat closed in this
+      // tab, in another tab, or by a rep shows up on the next tick either way.
+      // Messages are still returned for a closed conversation — a rep's last
+      // word, sent just before the close, must not be swallowed by it.
+      closed: isClosed(conversation.status),
       status: conversation.status ?? null,
       conversationId: conversation.id,
     };
@@ -639,12 +762,13 @@ async function pollRepMessages({
     );
     // The widget retries on its next tick; an outage must never surface as a
     // 500 to a page that is polling every few seconds.
-    return { messages: [], live: false, status: null, error: true };
+    return { messages: [], live: false, closed: false, status: null, error: true };
   }
 }
 
 export {
   ensureConversation,
+  closeConversation,
   pollRepMessages,
   parsePollCursor,
   POLL_PAGE_SIZE,
@@ -655,6 +779,7 @@ export {
   resolveLiveMode,
   recordVisitorTurn,
   isClaimed,
+  isClosed,
   isSalesforceConfigured,
   visitorMessages,
   lastVisitorMessage,

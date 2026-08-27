@@ -58,6 +58,9 @@ Response — `200`:
   gathered, and `{}` whenever `handoff` is `false`.
 - `sessionId` is echoed back when supplied, otherwise generated (`crypto.randomUUID()`), so the
   client can keep using the same value for the rest of the conversation.
+- A chat turn on a conversation a rep has taken comes back as `{ "reply": null, "live": true }`, and
+  one on a chat the visitor has ended as `{ "reply": null, "closed": true, "live": false }`. Both
+  echo `handoffContext` untouched. See **Live mode** below.
 
 **Request rules** (violations return `400` with a specific message):
 
@@ -87,6 +90,7 @@ Response — `200`:
     { "id": "a02Ab000001XyZ", "body": "Dana here — got your details.", "sentAt": "2026-08-26T18:02:00.000Z" }
   ],
   "live": true,
+  "closed": false,
   "status": "Claimed",
   "conversationId": "a01Ab000001AbC",
   "sessionId": "3cb524a3-..."
@@ -103,14 +107,73 @@ Response — `200`:
   messages rather than replaying the bot's own words back into the widget.
 - `after` is optional and accepts either an ISO timestamp (the `sentAt` of the last message shown —
   preferred) or a `Message__c` id. Messages at or before it are not re-sent.
-- `live` is `true` only while `Status__c === 'Claimed'`. A `Closed` conversation still returns the
-  rep's final messages.
-- No conversation for that session yet → `{ "messages": [], "live": false, "status": null }`.
-- **Salesforce unreachable → still `200`,** with `{ "messages": [], "live": false, "error": true }`,
+- `live` is `true` only while `Status__c === 'Claimed'`; `closed` is `true` only while it is
+  `'Closed'`. Never both. A `Closed` conversation still returns the rep's final messages — a last
+  word sent just before the visitor ended the chat must not be swallowed by the close.
+- No conversation for that session yet → `{ "messages": [], "live": false, "closed": false, "status": null }`.
+- **Salesforce unreachable → still `200`,** with `{ "messages": [], "live": false, "closed": false, "error": true }`,
   so the widget just retries on its next tick. A page polling every few seconds never gets a `500`.
 - One SOQL per poll, plus the external-id read that resolves the session; both reuse the cached
   access token, so a warm container polls without re-authenticating.
 - `sessionId` is **required** here (a poll for no session is meaningless) — omitting it is a `400`.
+
+### `POST /` — `{ "action": "close" }`
+
+The widget's **End Chat** button. Sets the conversation's `Status__c` to `'Closed'` and nothing else.
+Same function, same Function URL, same `x-widget-token` gate; it never reaches Claude.
+
+```json
+{ "action": "close", "sessionId": "3cb524a3-..." }
+```
+
+Response — `200`:
+
+```json
+{
+  "closed": true,
+  "reply": null,
+  "live": false,
+  "status": "Closed",
+  "conversationId": "a01Ab000001AbC",
+  "sessionId": "3cb524a3-..."
+}
+```
+
+- **Idempotent.** An already-closed conversation reports `closed: true` with `alreadyClosed: true`
+  and issues no second write.
+- A **`Claimed`** conversation closes too: a visitor ending the chat outranks a rep holding it, and
+  the rep sees the status change in Salesforce.
+- **No conversation for that session** → `200` with `{ "closed": false, "notFound": true }`. The
+  `Conversation__c` is only created at handoff, so a visitor who never asked for a human has nothing
+  to close; the widget ends the chat on its own side either way. Nothing is created just to close it.
+- **Salesforce unreachable → still `200`,** with `{ "closed": false, "error": true }`. A visitor on
+  their way out of the chat must not be shown an error to leave; the cost is a conversation left open
+  in Salesforce for a rep to tidy up.
+- `sessionId` is **required** — omitting it (or sending a blank one) is a `400`.
+
+### Live mode: the three states the widget renders
+
+`Status__c` on `Conversation__c` is the single source of truth, and the chat turn reports it:
+
+| `Status__c` | Chat-turn response | Who answers |
+| ----------- | ------------------ | ----------- |
+| `New` (or no conversation) | `reply: "..."` | The **bot**. Claude is called normally. |
+| `Claimed`   | `reply: null, live: true`   | A **rep**, in Salesforce. The visitor's message is still recorded `Inbound`; the rep's answers reach the widget via the poll. |
+| `Closed`    | `reply: null, closed: true` | **Nobody.** The chat is over. |
+
+Two transitions matter beyond the initial takeover:
+
+- **Rep hands back** (`Claimed` → `New`, set by the rep in Salesforce). The bot resumes on the very
+  next turn, with no special handling: it answers from the full transcript the widget sends — the
+  rep's own turns included, since the widget rendered them as assistant turns — and because the
+  conversation already exists the turn *appends* the new exchange rather than backfilling a second
+  copy of the thread. The once-per-session lead guard still holds, so handing back cannot produce a
+  second `Lead`.
+- **Visitor ends the chat** (→ `Closed`, via `action: "close"`). **Terminal.** No bot reply, no bot
+  resume, and not one write against the finished record: `recordVisitorTurn` re-checks the status and
+  refuses to append, which is what stops a Salesforce outage — during which the live-mode check fails
+  open and the bot answers — from writing to a closed conversation anyway. Nothing in this Lambda
+  reopens a conversation; a rep changing the status back in Salesforce is the only way.
 
 ### Handoff detection
 
