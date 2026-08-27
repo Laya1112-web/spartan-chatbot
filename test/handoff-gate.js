@@ -365,7 +365,12 @@ async function main() {
     // Parser-level tests cannot catch a broken reference in the handler body,
     // so drive the real handler with a canned model response.
     process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'sk-ant-test-dummy';
-    const { handler } = await import("../index.js");
+    const { handler, setClock } = await import("../index.js");
+    // Pin the clock inside business hours (Wed 2:00pm ET), so the after-hours gate
+    // in businessHours.js stays dormant and this file's assertions on exact reply
+    // text hold whatever hour the suite actually runs at.
+    setClock(() => new Date("2026-01-14T19:00:00Z"));
+
 
     const realFetch = globalThis.fetch;
     let modelText = '';

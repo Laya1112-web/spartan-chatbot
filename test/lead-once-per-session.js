@@ -24,7 +24,13 @@ delete process.env.WIDGET_TOKEN;
 delete process.env.SF_PRIVATE_KEY;
 delete process.env.SF_CLIENT_ID;
 
-const { handler, parseContextLeadId, parseHandoffContext } = await import("../index.js");
+const { handler, parseContextLeadId, parseHandoffContext, setClock } =
+  await import("../index.js");
+// Pin the clock inside business hours (Wed 2:00pm ET), so the after-hours gate
+// in businessHours.js stays dormant and this file's assertions on exact reply
+// text hold whatever hour the suite actually runs at.
+setClock(() => new Date("2026-01-14T19:00:00Z"));
+
 const { maybeCreateLead } = await import("../leadHandoff.js");
 
 let passed = 0;

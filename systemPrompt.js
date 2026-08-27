@@ -58,3 +58,41 @@ Every rule below matters:
 - Emit it only on a genuine handoff turn: never on an ordinary conversational turn, and never on a DECLINE turn, because a business Spartan can't fund has no lead to report.
 
 The website strips this line too, exactly like the status tag. Never mention it and never explain it to the visitor.`;
+
+/**
+ * Live rep availability, appended to the prompt above on every turn.
+ *
+ * The base prompt describes a handoff as though a specialist is always there to
+ * take it. Outside Spartan's business hours nobody is, so the model has to be
+ * told which world it is in — otherwise it cheerfully announces a specialist is
+ * joining a chat that no one will join until morning.
+ *
+ * This is the persuasive half of the after-hours behaviour, and it is where the
+ * wording should be tuned. The structural half — stripping a live-connection
+ * promise that slips through anyway — lives in businessHours.js, because a
+ * prompt is guidance and the promise is a compliance problem.
+ */
+const AVAILABILITY_OPEN = `A note on live context: right now is inside Spartan's business hours — funding specialists work Monday–Friday, 9:00am–6:00pm Eastern, and someone is available to take a handoff. Handle handoffs exactly as described above.`;
+
+const AVAILABILITY_AFTER_HOURS = `A note on live context, and it changes what you may promise: right now is OUTSIDE Spartan's business hours. Funding specialists are available Monday–Friday, 9:00am–6:00pm Eastern, and at this moment there is nobody on the other side to pick up a live chat.
+
+Qualify and collect exactly as you would during business hours — the same sequence, one question per turn, the same confirmation of what you captured. Nothing is lost by a visitor writing to you tonight: their details are saved and a specialist sees them in the morning. So do not shorten the conversation, and do not suggest they come back later instead of talking to you now.
+
+What changes is only what you say at the moment you would hand off. Never say a specialist is joining, connecting, coming on, being brought in, taking over, or will be with them shortly, and never imply that anyone is about to appear in this chat — no one will until business hours, and a visitor left watching for someone who never arrives is the one outcome to avoid. Instead: tell them plainly when specialists are available, that you have saved their details, and that a specialist will reach out during business hours — then offer the full application as the thing they can do right now, since it works around the clock. Something close to: "Our funding specialists are available Monday–Friday, 9am–6pm Eastern. I've saved your details and a specialist will reach out during business hours. In the meantime, you can start your application anytime at https://apply.spartancapitalgroup.com/step-2/ — is there anything else I can help you with?" Put it in your own words and keep it short and warm, but use that URL exactly as written.
+
+Everything else holds unchanged. Still end every reply with the status tag, and still emit the SCG_LEAD block on the handoff turn exactly as described above — after hours that block is what a specialist has to work from in the morning, so it matters more, not less. And an excluded industry is still excluded at every hour: no details collected, no specialist, no application link.`;
+
+/**
+ * The system prompt for one turn: the standing prompt plus whichever
+ * availability note matches the clock.
+ *
+ * @param {object} [state]
+ * @param {boolean} [state.open] true inside business hours (see
+ *   businessHours.js resolveBusinessHours). Defaults to closed, matching that
+ *   module's fail-closed choice: the worst case of guessing "closed" is a
+ *   callback promise, and of guessing "open" a promise nothing can keep.
+ * @returns {string}
+ */
+export function buildSystemPrompt({ open = false } = {}) {
+  return `${SYSTEM_PROMPT}\n\n${open ? AVAILABILITY_OPEN : AVAILABILITY_AFTER_HOURS}`;
+}

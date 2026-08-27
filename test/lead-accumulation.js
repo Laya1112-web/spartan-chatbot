@@ -35,7 +35,13 @@ const {
   mergeLeadFields,
   meetsLeadMinimum,
   missingForLeadMinimum,
+  setClock,
 } = await import("../index.js");
+// Pin the clock inside business hours (Wed 2:00pm ET), so the after-hours gate
+// in businessHours.js stays dormant and this file's assertions on exact reply
+// text hold whatever hour the suite actually runs at.
+setClock(() => new Date("2026-01-14T19:00:00Z"));
+
 const { maybeCreateLead } = await import("../leadHandoff.js");
 const { buildLeadPayload } = await import("../salesforce.js");
 

@@ -17,7 +17,12 @@ import assert from "node:assert";
 process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "sk-ant-test-dummy";
 delete process.env.WIDGET_TOKEN;
 
-const { handler } = await import("../index.js");
+const { handler, setClock } = await import("../index.js");
+// Pin the clock inside business hours (Wed 2:00pm ET), so the after-hours gate
+// in businessHours.js stays dormant and this file's assertions on exact reply
+// text hold whatever hour the suite actually runs at.
+setClock(() => new Date("2026-01-14T19:00:00Z"));
+
 
 // Every outbound call is stubbed. `fetches` is the proof that a 401 request
 // touched nothing -- the Anthropic SDK and salesforce.js both go through fetch.

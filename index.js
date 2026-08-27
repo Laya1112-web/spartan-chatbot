@@ -4,7 +4,8 @@
  * format 2.0); there is no API Gateway in front of it.
  *
  *   POST /  { messages: [{role, content}, ...], sessionId?, handoffContext? }
- *        -> { reply, handoff, handoffFields, handoffContext, sessionId }
+ *        -> { reply, handoff, handoffFields, handoffContext, sessionId,
+ *             liveHandoff, businessHours }
  *        -> { reply: null, live: true, ... }    a rep has claimed the chat
  *        -> { reply: null, closed: true, ... }  the chat is over
  *
@@ -24,6 +25,12 @@
  * answering), New (the bot is answering — including a conversation a rep handed
  * back), and Closed (nobody is; the thread is finished).
  *
+ * Reps work Mon-Fri 9:00am-6:00pm Eastern. Outside that window the bot still
+ * qualifies the visitor and still writes the Lead and the Conversation__c, but
+ * it must not promise a live specialist: `liveHandoff` goes false and the reply
+ * passes through the after-hours gate (see businessHours.js). A conversation a
+ * rep has already claimed is exempt — it returns above, before the gate exists.
+ *
  * handoffContext round-trips the lead fields accumulated so far: this handler
  * strips SCG_LEAD from the reply it returns, so the blocks do not survive in
  * the transcript the widget echoes back. The widget sends the handoffContext it
@@ -35,9 +42,10 @@
 import { randomUUID } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 
-import { SYSTEM_PROMPT } from "./systemPrompt.js";
+import { buildSystemPrompt } from "./systemPrompt.js";
 import { shouldHandoff, detectHandoff, recoverContactFields } from "./intent.js";
 import { maybeCreateLead } from "./leadHandoff.js";
+import { resolveBusinessHours, enforceAfterHoursReply } from "./businessHours.js";
 import {
   resolveLiveMode,
   recordVisitorTurn,
@@ -60,6 +68,21 @@ const ALLOWED_ORIGINS = new Set([
 // rather than forwarding an unbounded payload to the API.
 const MAX_MESSAGES = 40;
 const MAX_CONTENT_CHARS = 4000;
+
+/**
+ * The clock, behind one indirection.
+ *
+ * Business-hours behaviour is the one thing in this handler that depends on
+ * when it runs, which would otherwise make it testable only by waiting until
+ * Tuesday evening. Tests pin this to a fixed instant via setClock(); production
+ * never calls it, and `new Date()` is the only thing it ever returns there.
+ */
+const clock = { now: () => new Date() };
+
+/** Exported so tests can pin the clock. Pass nothing to restore real time. */
+function setClock(fn) {
+  clock.now = typeof fn === "function" ? fn : () => new Date();
+}
 
 const GENERIC_ERROR = "Sorry — something went wrong on our end. Please try again in a moment.";
 const EMPTY_REPLY_FALLBACK =
@@ -201,6 +224,12 @@ export const handler = async (event) => {
       // The visitor's message was recorded by resolveLiveMode; the rep replies
       // in Salesforce. `reply: null` plus `live: true` tells the widget to
       // render nothing from the bot and keep the thread open.
+      //
+      // Deliberately AHEAD of the business-hours gate below, and deliberately
+      // untouched by it. A chat that went live at 5:50pm is still live at 6:05
+      // — the rep is sitting in it — and the gate has no business interrupting
+      // a conversation a human already owns. The gate only ever affects a turn
+      // the BOT is answering, which is to say a NEW handoff offer.
       return json(200, headers, {
         reply: null,
         live: true,
@@ -217,13 +246,23 @@ export const handler = async (event) => {
       });
     }
 
+    // Is a rep actually available to take a handoff right now? Reps work
+    // Mon–Fri 9:00am–6:00pm Eastern, so outside that window the bot must still
+    // qualify and capture the lead but must not promise a live specialist.
+    // Resolved before the Claude call because it changes the system prompt, and
+    // AFTER the live-mode check above so a conversation a rep already holds is
+    // never touched by it.
+    const businessHours = resolveBusinessHours(clock.now());
+
     const response = await getClient().messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       // Thinking tokens would eat into the 1024-token budget and add latency
       // to a live chat widget; a website Q&A turn doesn't need it.
       thinking: { type: "disabled" },
-      system: SYSTEM_PROMPT,
+      // The standing prompt plus this turn's availability note: the model's
+      // handoff language has to differ at 11pm from what it says at 11am.
+      system: buildSystemPrompt(businessHours),
       messages, // full conversation history, every turn (the API is stateless)
     });
 
@@ -239,7 +278,8 @@ export const handler = async (event) => {
     // reach a visitor; the status drives the gate, the block supplies values.
     const status = parseStatusTag(extractText(response));
     const lead = parseLeadBlock(status.text);
-    const reply = lead.text || EMPTY_REPLY_FALLBACK;
+    // `let`: the after-hours gate below may rewrite it.
+    let reply = lead.text || EMPTY_REPLY_FALLBACK;
 
     // Everything the conversation has reported, accumulated every turn — not
     // only on the turn a handoff fires — so the running set is always current
@@ -335,6 +375,65 @@ export const handler = async (event) => {
       });
     }
 
+    // Whether a live specialist is actually being brought in on this turn. The
+    // handoff itself is unconditional — the Lead and the Conversation__c are
+    // written at 2am exactly as at 2pm — but the "a specialist is joining you"
+    // half of it only holds while somebody is there to join. The widget uses
+    // this to decide whether to show its live-chat affordances.
+    //
+    // Built from `handoff`, not `wantsHandoff`, so liveHandoff implies handoff:
+    // a rep can only claim a Conversation__c that exists, and that record is
+    // only created once a lead does. A turn where the visitor asked but the
+    // minimum is not met yet is still the bot collecting, not a rep arriving.
+    const liveHandoff = businessHours.open && handoff;
+
+    // THE STRUCTURAL AFTER-HOURS GATE.
+    //
+    // systemPrompt.js already tells the model that reps are offline and what to
+    // say instead, and that handles the ordinary case. This is what makes it a
+    // guarantee rather than a hope: a prompt can be ignored, and "a specialist
+    // is connecting now" at 11pm is a promise nothing can keep — the visitor
+    // waits at an empty chat until morning. So any sentence claiming a live
+    // human is removed here, and the true version (the hours, the details
+    // saved, the application that does work right now) is appended in its
+    // place.
+    //
+    // Placed before both the Salesforce write below and the response, so the
+    // visitor and the rep's morning transcript read the same text. A declined
+    // business is exempt from the append: no specialist and no application link
+    // at any hour.
+    if (!businessHours.open) {
+      const gated = enforceAfterHoursReply(reply, {
+        // `handoff`, again, and for a second reason: appending the application
+        // link keys off the same moment. A visitor two questions into the
+        // collection sequence should not have the link pushed at them, which is
+        // the ordering the standing prompt already keeps.
+        handoff,
+        declined: status.declined,
+      });
+      if (gated.stripped.length > 0) {
+        // Worth seeing in CloudWatch: the prompt did not hold, and the gate is
+        // the only reason the visitor was not promised a specialist. Recurring
+        // entries here are a prompt-tuning signal.
+        console.warn("spartan-chatbot: after-hours live-specialist promise stripped", {
+          sessionId,
+          etHour: businessHours.hour,
+          etWeekday: businessHours.weekday,
+          stripped: gated.stripped,
+        });
+      }
+      if (gated.changed) {
+        console.log("spartan-chatbot: after-hours reply gate applied", {
+          sessionId,
+          etHour: businessHours.hour,
+          etWeekday: businessHours.weekday,
+          strippedSentences: gated.stripped.length,
+          appendedNotice: gated.appended,
+        });
+      }
+      reply = gated.reply;
+    }
+
     // Deliver the lead. Runs only now that `reply` has both tags stripped and
     // the contact fallback has filled any gaps, so Salesforce sees the final
     // field set. maybeCreateLead is gated on handoff === true and swallows
@@ -411,6 +510,14 @@ export const handler = async (event) => {
         ...(leadId && { leadId }),
       },
       sessionId,
+      // True only when a rep can actually pick this up. `handoff` says a lead
+      // was captured; `liveHandoff` says a human is joining.
+      liveHandoff,
+      businessHours: {
+        open: businessHours.open,
+        hours: businessHours.hours,
+        timezone: businessHours.timezone,
+      },
       ...(handoffDeferred && { handoffDeferred: true }),
       ...(leadId && { leadId }),
       ...(conversationId && { conversationId }),
@@ -909,4 +1016,5 @@ export {
   accumulateLeadFields,
   meetsLeadMinimum,
   missingForLeadMinimum,
+  setClock,
 };

@@ -17,7 +17,8 @@ fields gathered so far are returned; delivering that lead is a separate piece of
 | File              | Purpose |
 | ----------------- | ------- |
 | `index.js`        | Lambda handler: CORS, request validation, Anthropic call, response shaping |
-| `systemPrompt.js` | Exported `SYSTEM_PROMPT` — products, states, qualifying guidelines, served/excluded industries, and the safety guardrails. Edits here are a compliance change |
+| `systemPrompt.js` | `SYSTEM_PROMPT` — products, states, qualifying guidelines, served/excluded industries, and the safety guardrails — plus `buildSystemPrompt()`, which appends the turn's rep-availability note. Edits here are a compliance change |
+| `businessHours.js` | Whether a rep is available right now (real `America/New_York` conversion) and the structural after-hours reply gate |
 | `intent.js`       | Handoff detection + best-effort extraction of name/email/phone/loan info |
 | `intent.test.js`  | Tests for the heuristics (`npm test`); not bundled into the deployment zip |
 
@@ -50,6 +51,8 @@ Response — `200`:
     "loanAmount": "$75,000",
     "loanPurpose": ["equipment", "inventory"]
   },
+  "liveHandoff": true,
+  "businessHours": { "open": true, "hours": "Monday–Friday, 9am–6pm Eastern", "timezone": "America/New_York" },
   "sessionId": "3cb524a3-553f-4650-9d70-961dac8ab851"
 }
 ```
@@ -58,6 +61,8 @@ Response — `200`:
   gathered, and `{}` whenever `handoff` is `false`.
 - `sessionId` is echoed back when supplied, otherwise generated (`crypto.randomUUID()`), so the
   client can keep using the same value for the rest of the conversation.
+- `liveHandoff` is `handoff` **and** a rep being on shift. `handoff: true, liveHandoff: false` is the
+  after-hours case: the lead was captured, but nobody is joining the chat. See **Business hours** below.
 - A chat turn on a conversation a rep has taken comes back as `{ "reply": null, "live": true }`, and
   one on a chat the visitor has ended as `{ "reply": null, "closed": true, "live": false }`. Both
   echo `handoffContext` untouched. See **Live mode** below.
@@ -206,6 +211,54 @@ Visitor intent is still deterministic regex, and it's still one API call per cha
 extraction reads the **visitor's** messages only, so a figure the bot mentions can't be captured as
 if the visitor had said it.
 
+### Business hours: when a live handoff is actually possible
+
+Funding specialists work **Monday–Friday, 9:00am–6:00pm Eastern**. Outside that window nobody claims
+a conversation, so "connecting you to a specialist now" is a promise nothing can keep — the visitor
+watches an empty chat until morning.
+
+Availability is resolved per turn in `businessHours.js`, from a real `Intl.DateTimeFormat` conversion
+with `timeZone: "America/New_York"`. **Not** a fixed UTC offset: that is wrong for half the year in
+either direction — assume `-05:00` and a 9:30am EDT visitor reads as 8:30am and gets turned away
+while reps are at their desks; assume `-04:00` and a 5:30pm EST visitor reads as 6:30pm and loses the
+last half hour of the day. Open is `Mon–Fri && 9 <= etHour < 18`; everything else is after hours. An
+unusable clock fails **closed**, because a false "open" promises a rep who does not exist while a
+false "closed" only promises a callback.
+
+What does **not** change after hours — this is the point:
+
+- The bot qualifies and collects exactly as it does at midday, one question per turn.
+- The `Lead` is written to Salesforce.
+- The `Conversation__c` is created, transcript and all, so a rep picks it up from the morning queue.
+
+What changes is only the language at the handoff moment, and it is enforced in two layers:
+
+1. **The prompt.** `buildSystemPrompt({ open })` appends an availability note telling the model that
+   reps are offline, that it must not say anyone is joining, and what to say instead: the hours, that
+   the details are saved, that a specialist will reach out during business hours — and the full
+   application as the thing that does work right now, since it is available 24/7.
+2. **The gate**, `enforceAfterHoursReply` in `businessHours.js`. A prompt is guidance, so the reply
+   is checked structurally: any sentence asserting a live human *now* — a connecting/transferring/
+   joining verb, or an immediacy phrase like "shortly" or "right away", in a sentence about a
+   specialist — is removed, and the availability notice is appended in its place. Stripping too much
+   is the safe direction here: a terse reply costs nothing, a surviving "a specialist is joining you"
+   costs the visitor their evening. Sentences that promise a *callback* ("a specialist will reach out
+   during business hours") are deliberately not matched, because that is the correct message.
+
+The gate runs before both the response and the Salesforce write, so the visitor and the rep's morning
+transcript read the same text. A **declined** business is exempt from the append: an excluded industry
+gets no specialist and no application link at any hour, and the after-hours notice must not become a
+back door to the link the decline path withholds.
+
+`liveHandoff` in the response is the flag a widget should branch on for its live-chat affordances:
+`handoff` says a lead was captured, `liveHandoff` says a human is joining.
+
+**A chat already live with a rep is never touched.** A conversation `Claimed` at 5:50pm is still
+claimed at 6:05pm — the rep is sitting in it — and that turn returns `{ reply: null, live: true }`
+from the live-mode check *before* business hours are even resolved. The gate only ever affects a turn
+the bot is answering, which is to say a **new** handoff offer. A rep who hands back (`Claimed` →
+`New`) after hours leaves the bot answering under the gate, which is correct.
+
 ## Environment variables
 
 | Name                | Required | Notes |
@@ -342,6 +395,12 @@ Heuristics (no API key or AWS needed):
 ```bash
 npm test
 ```
+
+Every handler test pins the clock via the `setClock` seam exported from `index.js`, so the suite is
+time-independent — it passes at 2pm on a Tuesday and at 2am on a Sunday alike.
+`test/business-hours.js` owns the availability behaviour: the EST/EDT conversion (including two cases
+that fail under either hardcoded offset), the reply gate, and the four end-to-end cases — during
+hours, weekday evening, weekend, and a conversation already live with a rep.
 
 Against the deployed URL:
 
