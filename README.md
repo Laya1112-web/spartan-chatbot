@@ -9,8 +9,12 @@ flag for whether the visitor wants to be handed to a human funding specialist.
 - **Invocation:** Lambda Function URL (buffered, payload format 2.0) — no API Gateway
 - **Model:** `claude-sonnet-5`, `max_tokens` 1024
 
-There is **no CRM/Salesforce integration in this function** by design. A handoff is flagged and the
-fields gathered so far are returned; delivering that lead is a separate piece of work.
+The bot is also reachable over **WhatsApp** (Cloud API) at `/whatsapp` on the same Function URL —
+same system prompt, same handoff rules, same Salesforce objects, different transport. See
+[WhatsApp (Cloud API)](#whatsapp-cloud-api).
+
+On a handoff the function writes a `Lead` and mirrors the conversation into `Conversation__c` /
+`Message__c`, which is also what makes the live-rep takeover possible.
 
 ## Files
 
@@ -20,6 +24,10 @@ fields gathered so far are returned; delivering that lead is a separate piece of
 | `systemPrompt.js` | `SYSTEM_PROMPT` — products, states, qualifying guidelines, served/excluded industries, and the safety guardrails — plus `buildSystemPrompt()`, which appends the turn's rep-availability note. Edits here are a compliance change |
 | `businessHours.js` | Whether a rep is available right now (real `America/New_York` conversion) and the structural after-hours reply gate |
 | `intent.js`       | Handoff detection + best-effort extraction of name/email/phone/loan info |
+| `botBrain.js`     | The transport-independent half of the bot: Anthropic client, model settings, the pinned clock, the `SCG_STATUS`/`SCG_LEAD` parsers, lead-field accumulation and the lead minimum. Shared by the web and WhatsApp paths |
+| `whatsapp.js`     | The Meta WhatsApp Cloud API transport: the GET verification handshake, the `X-Hub-Signature-256` HMAC, payload parsing, wamid dedupe, and the outbound send |
+| `whatsappConversation.js` | `Conversation__c`/`Message__c` keyed on `Whatsapp_Wa_Id__c` — explicit `Channel__c`, the Closed→New reopen, `Last_Inbound_At__c`, and the transcript read |
+| `whatsappWebhook.js` | The WhatsApp turn: routing, return-200-fast dispatch, and the AI/lead/Salesforce flow reusing every module above |
 | `intent.test.js`  | Tests for the heuristics (`npm test`); not bundled into the deployment zip |
 
 ## API
@@ -259,13 +267,209 @@ from the live-mode check *before* business hours are even resolved. The gate onl
 the bot is answering, which is to say a **new** handoff offer. A rep who hands back (`Claimed` →
 `New`) after hours leaves the bot answering under the gate, which is correct.
 
+## WhatsApp (Cloud API)
+
+The same bot, reached over WhatsApp instead of the website widget. Two endpoints on the existing
+Function URL, routed **before** the CORS headers and the `x-widget-token` gate — Meta is not a
+browser, sends no `Origin`, will never send that header, and needs `GET` answered. On this path the
+HMAC signature is the auth.
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `GET /whatsapp`  | Meta's one-time verification handshake |
+| `POST /whatsapp` | Signed message and status events |
+
+### `GET /whatsapp` — verification
+
+Meta sends `hub.mode=subscribe`, `hub.verify_token`, `hub.challenge`. On a token match the response
+is **`200` with the challenge as plain text and nothing else** — Meta compares the body byte for
+byte, so a JSON-wrapped or quoted challenge fails the handshake even when the token was right.
+A mismatch, a different `hub.mode`, or an unset `WHATSAPP_VERIFY_TOKEN` all give `403`.
+
+### `POST /whatsapp` — messages
+
+Payload shape (Cloud API v23.0):
+
+```
+entry[].changes[].value.messages[]  { from (wa_id), id (wamid), timestamp, type, text.body }
+entry[].changes[].value.contacts[]  { wa_id, profile.name }
+entry[].changes[].value.metadata    { phone_number_id }
+entry[].changes[].value.statuses[]  delivery receipts — counted and dropped
+```
+
+Order of operations, and why:
+
+1. **Signature first.** HMAC-SHA256 of the **raw** body under `WHATSAPP_APP_SECRET`, compared
+   constant-time against `X-Hub-Signature-256: sha256=<hex>`. The raw bytes are the only thing that
+   can be hashed: `JSON.parse` → `JSON.stringify` changes key order, whitespace and unicode
+   escaping, and every check would fail. A Lambda Function URL may deliver the body base64-encoded,
+   so the decode happens in `rawBody()` and the resulting `Buffer` feeds both the HMAC and the parse.
+   A bad or missing signature is a `403` that reaches neither Claude nor Salesforce.
+2. **Statuses ignored.** Delivery receipts are most of the real traffic and are not visitor turns.
+   Counted for the log, acknowledged with `200` so Meta never retries them.
+3. **Dedupe by wamid.** A Meta retry carries the same message id as the original. The claim is taken
+   at receipt, before the slow work starts, because that window is exactly when a retry arrives.
+4. **Return `200` fast** (below), then the AI turn.
+
+### Returning 200 fast
+
+Meta retries anything that is not a prompt `200` and eventually **disables** a webhook that keeps
+failing. One turn here is a Claude call plus several Salesforce round-trips — seconds, not
+milliseconds. A Function URL response is buffered, so work started and not awaited is frozen the
+moment the handler returns; `void doWork()` would silently lose the reply.
+
+So the POST handler does only the fast local work (signature, parse, dedupe), **invokes this same
+Lambda a second time** with `InvocationType: 'Event'`, and returns `200` immediately. The second
+invocation arrives as `{ whatsappJob: { … } }`, is routed at the top of `index.js`, and does the
+Claude/Salesforce/send work with nobody waiting on it.
+
+This needs **`lambda:InvokeFunction` on the function's own execution role**:
+
+```bash
+aws iam put-role-policy --profile spartan \
+  --role-name spartan-chatbot-role \
+  --policy-name spartan-chatbot-self-invoke \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-1:826917684352:function:spartan-chatbot"
+    }]
+  }'
+```
+
+Until that policy is attached the dispatch fails and the handler **falls back to processing inline**,
+still returning `200` — the visitor gets their reply, it just takes the `200` with it. Watch for
+`async dispatch unavailable` in CloudWatch; that line means the fallback is in use.
+
+`@aws-sdk/client-lambda` is supplied by the `nodejs20.x` runtime and is deliberately **not** a
+dependency of this package, so it is loaded with `import()` rather than a static import — a static
+one would be evaluated by the test suite, where the package does not exist, and would fail at load.
+That `import()` runs at **module scope**, so it resolves during Lambda's INIT phase rather than
+inside a request Meta is timing; both outcomes settle into a plain object, so it can neither reject
+nor raise an unhandled rejection, and a context without the package degrades to the inline fallback.
+
+Measured before that change: the first dispatch in a container cost ~2.8s — and it cost that on a
+*warm* container too, because the client cache is per-container and a container warmed by anything
+that is not a dispatch (a verification GET, a widget chat turn) still paid the whole import on its
+first WhatsApp message. Loading at INIT removes that case. It does not make a genuine cold start
+faster: Meta waits for INIT plus the handler either way, so there the cost moves rather than
+disappears.
+
+### The conversation
+
+Keyed on `Whatsapp_Wa_Id__c` (external id, unique), not `Session_Id__c`: WhatsApp has no sessions,
+just one thread per phone number for ever.
+
+- **`Channel__c` is set to `'WhatsApp'` explicitly on create.** The field defaults to `Web`, and a
+  WhatsApp thread that inherits the default shows up in the web rep panel as though somebody were
+  sitting on the website waiting. This is the one field that must never be dropped.
+- **A `Closed` conversation reopens** (`Status__c` back to `New`) on the next inbound. On the web,
+  Closed is terminal — the visitor pressed End Chat and the tab is gone. On WhatsApp the same person
+  messaging next week is the same thread, and refusing to answer would look like a broken number.
+- **`Status__c === 'Claimed'` means the model is not called at all.** The message is recorded Inbound
+  and the rep answers in Salesforce, exactly as on the web path. No automatic nudge is sent either,
+  including for an unreadable message type — interjecting over a rep is what live mode prevents.
+- **`Last_Inbound_At__c` is stamped on every inbound.** It is the 24-hour-window clock (below).
+- `Session_Id__c` is set to `wa:<wa_id>` on create, so the record is addressable by the machinery the
+  web path already has. Nothing in this transport needs it.
+- **No name is written.** The fields the create sets are `Channel__c`, `Status__c`, `Session_Id__c`,
+  `Whatsapp_Phone__c` and (once one exists) `Lead__c`. The visitor's name is the Lead's, not the
+  conversation's.
+
+### What differs from the web path, and what does not
+
+Everything about *the bot* is reused, not reimplemented: `systemPrompt.js`, the excluded-industry
+decline, `intent.js`, `leadHandoff.js`, the lead minimum, the after-hours gate, and the
+`Conversation__c`/`Message__c` shape. WhatsApp is a transport.
+
+Two things the widget provides for free that this path has to solve:
+
+| | Web | WhatsApp |
+| --- | --- | --- |
+| The transcript | the widget posts the whole thread every turn | re-read from `Message__c` and the new message appended (one extra SOQL per turn) |
+| Lead-field accumulation | round-trips through `handoffContext` | a warm-container store keyed by `wa_id`, plus a transcript scan, plus this turn's `SCG_LEAD` block |
+
+The lead-field store is best-effort in the same honest way `leadMemory` is — a cold start forgets.
+What makes that survivable is that it is not the primary mechanism: the model is handed the whole
+thread from Salesforce every turn and re-reports its block when it wraps up. The guard against a
+**duplicate** lead is *not* best-effort here — `Conversation__c.Lead__c` is read back on every
+inbound, which is stronger than anything the web path has. Note the web path's secondary guard
+("a conversation exists, so a lead must too") does not hold on WhatsApp and must not be borrowed:
+here the conversation is created on the first inbound, long before any handoff.
+
+The visitor's phone number needs no collecting — the `wa_id` *is* their number. It is merged in
+underneath anything the conversation reported, so a different callback number wins.
+
+### Message types
+
+`text` is the ordinary case; `button` and `interactive` replies are read the same way (still text the
+visitor chose). Anything else — image, voice note, document, location — is recorded Inbound as
+`[<type> message received …]` and answered with a short nudge to type instead. The model is never
+called for one.
+
+Long replies are **split** into consecutive messages rather than truncated: Meta rejects a text body
+over 4096 characters.
+
+### Known limitations
+
+- **The 24-hour window.** Meta only allows free-form (non-template) messages within 24 hours of the
+  visitor's last inbound. **The AI path is always inside it by construction** — the bot only ever
+  speaks because the visitor just messaged. The case that can fall outside is a **rep** replying
+  later from the Salesforce console, and that is the rep-panel step's problem to solve, with an
+  approved template to reopen the window. `Last_Inbound_At__c` is stamped here precisely so that
+  panel can tell whether the window is still open.
+- **Dedupe is warm-container memory.** It covers the realistic case (a retry arriving seconds after
+  the original, at a Lambda that is certainly still warm); a cold start or a second concurrent
+  container can let a redelivery through. The residual risk is a duplicate reply, never a lost
+  message. The durable version is a `Wamid__c` external id on `Message__c`.
+- **The visitor's name is not on the conversation.** `Conversation__c` has no visitor-name field —
+  the name belongs to the Lead, where the bot collects it in the visitor's own words. The WhatsApp
+  profile name that arrives on every inbound is logged and nothing else; it is deliberately not
+  promoted into the lead fields, because a display name ("Mom", an emoji, a business slogan) would
+  satisfy the name half of the lead minimum and produce exactly the placeholder record that gate
+  exists to stop. Routing it in as a labelled fallback is a possible follow-up, not current
+  behaviour.
+- **One number.** `WHATSAPP_PHONE_NUMBER_ID` is a single value; the `value.metadata.phone_number_id`
+  on inbound events is parsed but not yet used to route between numbers.
+
+### Setting it up in the Meta app dashboard
+
+1. Set all four env vars on the Lambda. `WHATSAPP_VERIFY_TOKEN` is a string **we** choose — generate
+   a fresh one and keep it out of version control:
+
+   ```bash
+   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+   ```
+
+   Referred to below as `<WHATSAPP_VERIFY_TOKEN>`.
+2. WhatsApp → Configuration → Edit the callback URL:
+   - **Callback URL:** `<function-url>whatsapp`
+   - **Verify token:** the same `WHATSAPP_VERIFY_TOKEN` value
+3. Verify and save. A `200` with the echoed challenge means the handshake passed; check CloudWatch
+   for `webhook verification succeeded`.
+4. Subscribe to the **`messages`** webhook field.
+5. Add your own number to the test recipients list and message the test number.
+
 ## Environment variables
 
 | Name                | Required | Notes |
 | ------------------- | -------- | ----- |
 | `ANTHROPIC_API_KEY` | **Yes**  | Anthropic API key. Never commit it; set it as a Lambda env var (see below). Missing key ⇒ logged `500`. |
+| `WHATSAPP_PHONE_NUMBER_ID` | WhatsApp | The Cloud API phone number id — the path segment on every send. Test number: `1240388075832660`. |
+| `WHATSAPP_ACCESS_TOKEN` | WhatsApp | Graph API bearer token. The dashboard's temporary token expires in 24h; a System User token is the permanent replacement. |
+| `WHATSAPP_VERIFY_TOKEN` | WhatsApp | A random string **we** choose, entered identically in the Meta app dashboard. Only used by the GET handshake. |
+| `WHATSAPP_APP_SECRET` | WhatsApp | Meta app secret (App Settings → Basic → App Secret). Used to verify the `X-Hub-Signature-256` HMAC on every POST. |
+| `WHATSAPP_ASYNC` | No | Set to `false` to force the webhook to do its work inline instead of self-invoking. Diagnostics only — see *Returning 200 fast* below. |
 
 The key is read from the environment at first use and the client is cached across warm invocations.
+
+**Both WhatsApp secrets fail CLOSED.** With `WHATSAPP_VERIFY_TOKEN` unset the handshake 403s; with
+`WHATSAPP_APP_SECRET` unset every webhook POST 403s. That is the opposite of `WIDGET_TOKEN`, which
+fails open — an unset widget token would lock real visitors out of the website, whereas an unset
+WhatsApp secret only means the webhook cannot be activated yet, and this endpoint spends money and
+writes to Salesforce on nothing but an unauthenticated POST.
 
 ## Deploy
 
@@ -401,6 +605,14 @@ time-independent — it passes at 2pm on a Tuesday and at 2am on a Sunday alike.
 `test/business-hours.js` owns the availability behaviour: the EST/EDT conversion (including two cases
 that fail under either hardcoded offset), the reply gate, and the four end-to-end cases — during
 hours, weekday evening, weekend, and a conversation already live with a rep.
+
+`test/whatsapp-webhook.js` owns the WhatsApp transport: the handshake (match, mismatch, unset token),
+the signature (valid, wrong HMAC, missing header, body tampered under a valid signature, wrong app
+secret, base64-encoded body, non-canonical key order — the last two are what prove the *raw* bytes
+are hashed and not a re-serialised parse), `Channel__c = 'WhatsApp'` on create, wamid dedupe, status
+events ignored, `Claimed` → no model call, `Closed` → reopened, the shape of the Graph API send, and
+that a widget POST at `/` is untouched by any of it. Meta and Salesforce are both stubbed at
+`globalThis.fetch`; there are no real network calls.
 
 Against the deployed URL:
 
