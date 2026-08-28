@@ -111,6 +111,58 @@ async function findWhatsAppConversation(waId, auth) {
 }
 
 /**
+ * Fetch a Conversation__c by its Salesforce Id.
+ *
+ * The inbound path keys on Whatsapp_Wa_Id__c because that is what Meta sends.
+ * The OUTBOUND path is the mirror image: Salesforce is the caller and already
+ * holds the record Id, so this looks up by Id and derives the wa_id from the
+ * record rather than trusting the caller for it. See whatsappOutbound.js —
+ * deriving the recipient is what stops the send endpoint becoming an open relay
+ * to any number if its shared secret ever leaks.
+ *
+ * Last_Inbound_At__c is the field the 24-hour-window guard is measured from,
+ * and it is org-dependent (see OPTIONAL_FIELDS), so a select that Salesforce
+ * rejects is retried without the optional columns rather than failing the
+ * lookup. A conversation whose window cannot be read is reported with
+ * lastInboundAt: null, which the caller treats as "unknown", not as "expired".
+ *
+ * @returns {Promise<{id, status, waId, lastInboundAt, channel, leadId}|null>}
+ *   null when no such record exists.
+ */
+async function getConversationById(conversationId, auth, logger = console) {
+  if (!SF_ID_RE.test(String(conversationId ?? ""))) return null;
+
+  const base = "Id,Status__c,Whatsapp_Wa_Id__c,Channel__c,Lead__c";
+  const withOptional = `${base},Last_Inbound_At__c`;
+  const url = (fields) =>
+    `/sobjects/${CONVERSATION_OBJECT}/${conversationId}?fields=${fields}`;
+
+  let status;
+  let body;
+  try {
+    ({ status, body } = await sfRequest(auth, url(withOptional)));
+  } catch (error) {
+    logger.error(
+      `[whatsapp] conversation read rejected with Last_Inbound_At__c; retrying ` +
+      `without it (the 24h window will read as unknown): ` +
+      `${error && error.message ? error.message : error}`,
+    );
+    ({ status, body } = await sfRequest(auth, url(base)));
+  }
+
+  if (status === 404 || !body || !body.Id) return null;
+
+  return {
+    id: body.Id,
+    status: body.Status__c ?? null,
+    waId: body.Whatsapp_Wa_Id__c ?? null,
+    lastInboundAt: body.Last_Inbound_At__c ?? null,
+    channel: body.Channel__c ?? null,
+    leadId: body.Lead__c ?? null,
+  };
+}
+
+/**
  * The thread so far, oldest first, in the shape the Messages API wants.
  *
  * Inbound becomes a user turn, Outbound an assistant turn — which means a rep's
@@ -360,6 +412,7 @@ async function recordWhatsAppMessage({
 
 export {
   findWhatsAppConversation,
+  getConversationById,
   ensureWhatsAppConversation,
   fetchTranscript,
   stampInbound,

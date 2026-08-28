@@ -213,7 +213,13 @@ function getHeader(event, name) {
   return key ? headers[key] : undefined;
 }
 
-/** Constant-time string compare that does not leak length. */
+/**
+ * Constant-time string compare that does not leak length.
+ *
+ * Both sides are hashed first, so the timingSafeEqual buffers are always the
+ * same size whatever the inputs were — comparing raw strings would either throw
+ * on a length mismatch or leak the expected length through the throw.
+ */
 function secretEquals(a, b) {
   const left = createHmac("sha256", "cmp").update(String(a)).digest();
   const right = createHmac("sha256", "cmp").update(String(b)).digest();
@@ -560,6 +566,8 @@ export {
   splitForWhatsApp,
   isWhatsAppConfigured,
   getHeader,
+  // Shared with the rep-send endpoint's shared-secret gate.
+  secretEquals,
   UNSUPPORTED_REPLY,
   SIGNATURE_HEADER,
   GRAPH_VERSION,

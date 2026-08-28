@@ -15,8 +15,9 @@
  *   POST /  { action: "close", sessionId }
  *        -> { closed, reply: null, live: false, status, sessionId }
  *
- *   GET  /whatsapp   Meta's webhook verification handshake
- *   POST /whatsapp   WhatsApp Cloud API message events
+ *   GET  /whatsapp        Meta's webhook verification handshake
+ *   POST /whatsapp        WhatsApp Cloud API message events
+ *   POST /whatsapp/send   a Salesforce rep's reply, out through Meta
  *        -> the same bot, reached over WhatsApp instead of the widget. Routed
  *           out to whatsappWebhook.js before any of the widget machinery below.
  *
@@ -74,6 +75,10 @@ import { buildSystemPrompt } from "./systemPrompt.js";
 import { shouldHandoff, detectHandoff, recoverContactFields } from "./intent.js";
 import { maybeCreateLead } from "./leadHandoff.js";
 import { resolveBusinessHours, enforceAfterHoursReply } from "./businessHours.js";
+import {
+  isWhatsAppSendRequest,
+  handleWhatsAppSend,
+} from "./whatsappOutbound.js";
 import {
   isWhatsAppRequest,
   isWhatsAppJob,
@@ -151,6 +156,28 @@ export const handler = async (event) => {
     // The asynchronous second invocation: this is the slow half of a webhook
     // POST, doing the Claude and Salesforce work Meta was not made to wait for.
     return await runWhatsAppJob(event);
+  }
+
+  // The rep-send endpoint. Checked BEFORE the webhook route below: both live
+  // under /whatsapp, and this one is authenticated by a Salesforce shared
+  // secret rather than by Meta's HMAC. Unlike the webhook it is allowed to fail
+  // loudly — Apex is the only caller, a rep is waiting on the answer, and a
+  // real status code is what lets the panel say why.
+  if (isWhatsAppSendRequest(event)) {
+    try {
+      return await handleWhatsAppSend(event);
+    } catch (error) {
+      console.error("spartan-chatbot: unhandled error on the WhatsApp send endpoint", {
+        name: error?.name,
+        message: error?.message,
+        stack: error?.stack,
+      });
+      return {
+        statusCode: 500,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ error: "internal_error" }),
+      };
+    }
   }
 
   if (isWhatsAppRequest(event)) {
