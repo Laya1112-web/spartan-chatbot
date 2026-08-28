@@ -548,7 +548,11 @@ async function processWhatsAppMessage(message, { logger = console, deps = {} } =
       model: MODEL,
       max_tokens: MAX_TOKENS,
       thinking: { type: "disabled" },
-      system: buildSystemPrompt(businessHours),
+      // Same prompt, framed for a texting medium: one-or-two-sentence replies,
+      // no markdown, and no claim to be a website. Every compliance rule —
+      // excluded industries, the numbers boundary, SCG_STATUS/SCG_LEAD — is
+      // identical to the web path's. See systemPrompt.js WHATSAPP_EDITS.
+      system: buildSystemPrompt({ ...businessHours, channel: "whatsapp" }),
       messages,
     });
   } catch (error) {

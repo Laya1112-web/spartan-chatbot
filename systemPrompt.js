@@ -82,17 +82,145 @@ What changes is only what you say at the moment you would hand off. Never say a 
 
 Everything else holds unchanged. Still end every reply with the status tag, and still emit the SCG_LEAD block on the handoff turn exactly as described above — after hours that block is what a specialist has to work from in the morning, so it matters more, not less. And an excluded industry is still excluded at every hour: no details collected, no specialist, no application link.`;
 
+/* ------------------------------------------------------------------ *
+ * Channel framing
+ * ------------------------------------------------------------------ */
+
 /**
- * The system prompt for one turn: the standing prompt plus whichever
- * availability note matches the clock.
+ * The WhatsApp rewrite of SYSTEM_PROMPT.
+ *
+ * WHAT THIS IS NOT: a second prompt. Every compliance-bearing rule above — the
+ * excluded industries, the never-quote-numbers boundary, the qualifying
+ * guidelines, the lead minimum, the SCG_STATUS and SCG_LEAD mechanics and every
+ * rule governing them — is carried through byte for byte. What changes is only
+ * how the assistant is told to WRITE, and the fact that it is not on a website.
+ *
+ * Done as targeted substitutions on the canonical prompt rather than as a
+ * separate copy, deliberately: a forked prompt drifts, and a compliance edit
+ * made here would silently reach one channel and not the other. There is
+ * exactly one source of truth, and this is a view onto it.
+ *
+ * Each pair below must match exactly once. If a future edit to SYSTEM_PROMPT
+ * changes one of these sentences, the substitution stops matching — so
+ * applyChannelEdits logs loudly and REPORTS the miss, and the channel test
+ * fails. Production degrades to web framing on WhatsApp (stiff, not wrong)
+ * rather than to a broken prompt.
+ */
+const WHATSAPP_EDITS = [
+  // 1. Not a website.
+  [
+    "You are the website assistant for Spartan Capital Group",
+    "You are the WhatsApp assistant for Spartan Capital Group",
+  ],
+  // 2. Texting length and rhythm. The second half of this paragraph — "Never
+  //    invent details about Spartan..." — is preserved verbatim; only the
+  //    medium and the length guidance change.
+  [
+    "Keep replies short — this is a chat widget, not an email. Two to four sentences is usually right. " +
+    "Be professional, warm, and genuinely useful, and ask one or two questions at a time instead of " +
+    "delivering a checklist.",
+
+    "This conversation is over WhatsApp, a texting medium. Keep replies to one or two short sentences " +
+    "— the length someone would actually text. Ask one question at a time, and never deliver a " +
+    "checklist. Be professional, warm, and genuinely useful.",
+  ],
+  // 3 & 4. The tags are still stripped before the visitor sees anything; it is
+  //        just not "the website" doing it.
+  [
+    "The website strips this line before showing your reply,",
+    "That line is stripped before your reply is sent,",
+  ],
+  [
+    "The website strips this line too, exactly like the status tag.",
+    "That line is stripped too, exactly like the status tag.",
+  ],
+];
+
+/**
+ * Formatting rules appended for WhatsApp only.
+ *
+ * WhatsApp renders no markdown. Asterisks, hyphens and hashes arrive as literal
+ * punctuation, so a reply the web widget renders as clean bold and bullets
+ * reads as clutter in a text thread — which is most of what "stiffer than the
+ * web bot" turned out to mean.
+ */
+const WHATSAPP_FORMATTING = `A note on formatting, because this is a text thread and not a web page. Use no markdown: no asterisks for bold, no underscores for italics, no bullet lists, no numbered lists, no headings, no hashes, no backticks. Write plain sentences and let them run on as ordinary prose. Write any link as a bare URL with nothing around it. Keep paragraphs to a line or two — if a reply is starting to need structure to be readable, it is too long for this medium and should be shorter instead.`;
+
+/**
+ * Apply a channel's substitutions, reporting any that did not match.
+ *
+ * @returns {{text: string, missed: string[]}}
+ */
+function applyChannelEdits(text, edits, logger = console) {
+  let out = text;
+  const missed = [];
+
+  for (const [from, to] of edits) {
+    if (!out.includes(from)) {
+      missed.push(from.slice(0, 60));
+      continue;
+    }
+    out = out.replace(from, to);
+  }
+
+  if (missed.length > 0) {
+    logger.error(
+      "systemPrompt: channel substitution(s) no longer match SYSTEM_PROMPT — " +
+      "the WhatsApp prompt has drifted back to web framing. Update WHATSAPP_EDITS. " +
+      `Missed: ${JSON.stringify(missed)}`,
+    );
+  }
+
+  return { text: out, missed };
+}
+
+/** Built once: the substitutions are deterministic and the prompt is static. */
+function buildWhatsAppPrompt(logger = console) {
+  const { text, missed } = applyChannelEdits(SYSTEM_PROMPT, WHATSAPP_EDITS, logger);
+  return { text: `${text}\n\n${WHATSAPP_FORMATTING}`, missed };
+}
+
+let whatsappPrompt;
+
+/**
+ * The system prompt for one turn: the standing prompt, framed for the channel,
+ * plus whichever availability note matches the clock.
+ *
+ * THE WEB PATH IS UNCHANGED. `channel` defaults to 'web', and on that branch
+ * this function returns exactly the string it returned before channels existed
+ * — same concatenation, same operands, no substitution pass. test/system-prompt-channels.js
+ * pins both web variants to a sha256 captured before the change, so a drift
+ * fails the suite rather than reaching production.
  *
  * @param {object} [state]
  * @param {boolean} [state.open] true inside business hours (see
  *   businessHours.js resolveBusinessHours). Defaults to closed, matching that
  *   module's fail-closed choice: the worst case of guessing "closed" is a
  *   callback promise, and of guessing "open" a promise nothing can keep.
+ * @param {'web'|'whatsapp'} [state.channel] the transport this turn arrived on.
+ *   Defaults to 'web'; an unrecognised value falls back to 'web' framing, which
+ *   is the safe direction — every compliance rule is identical either way.
  * @returns {string}
  */
-export function buildSystemPrompt({ open = false } = {}) {
-  return `${SYSTEM_PROMPT}\n\n${open ? AVAILABILITY_OPEN : AVAILABILITY_AFTER_HOURS}`;
+export function buildSystemPrompt({ open = false, channel = "web" } = {}) {
+  const availability = open ? AVAILABILITY_OPEN : AVAILABILITY_AFTER_HOURS;
+
+  if (channel !== "whatsapp") {
+    // Byte-for-byte the pre-channel expression. Do not refactor this branch to
+    // share code with the one below: its output is pinned by hash.
+    return `${SYSTEM_PROMPT}\n\n${availability}`;
+  }
+
+  if (!whatsappPrompt) whatsappPrompt = buildWhatsAppPrompt();
+  return `${whatsappPrompt.text}\n\n${availability}`;
+}
+
+/** Exported for tests: proves every channel substitution still matches. */
+export function channelEditReport() {
+  return {
+    whatsapp: {
+      edits: WHATSAPP_EDITS.length,
+      missed: buildWhatsAppPrompt({ error() {} }).missed,
+    },
+  };
 }
