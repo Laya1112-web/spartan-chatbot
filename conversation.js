@@ -768,6 +768,9 @@ async function pollRepMessages({
 
 export {
   ensureConversation,
+  // Low-level seam for whatsappConversation.js, which is a third consumer of
+  // the same Connected App, the same objects and the same 401-retry policy.
+  sfRequest,
   closeConversation,
   pollRepMessages,
   parsePollCursor,
