@@ -227,6 +227,40 @@ function ok(payload = {}) {
  * Returning 200 fast: the self-invocation
  * ------------------------------------------------------------------ */
 
+/**
+ * The Lambda SDK, loaded during INIT rather than on the first webhook POST.
+ *
+ * This is deliberately started at module scope and NOT awaited here. Module
+ * evaluation is Lambda's INIT phase, so the import — and the client
+ * construction chained onto it — happen while the container is being built
+ * instead of inside a request that Meta is timing. Measured before this change,
+ * the first dispatch in a container cost ~2.8s, and it cost that on a WARM
+ * container too: `lambdaClient` is per-container, so a container warmed by
+ * anything that is not a dispatch (a verification GET, a widget chat turn) still
+ * paid the full import on its first WhatsApp message.
+ *
+ * It stays an import() expression rather than a static `import ... from`
+ * because @aws-sdk/client-lambda is supplied by the nodejs20.x runtime and is
+ * NOT a dependency of this package: a static import would be evaluated in the
+ * test suite too, where the package does not exist, and would fail at load with
+ * ERR_MODULE_NOT_FOUND before a single test ran.
+ *
+ * Both outcomes are settled into a plain object, so this promise can never
+ * reject and can never raise an unhandled rejection at INIT. A context without
+ * the package resolves to `{ error }`, which dispatchAsync reports as an
+ * unavailable dispatch — the same graceful degradation as before, just decided
+ * earlier.
+ *
+ * Note what this does NOT fix: on a genuine cold start Meta waits for INIT plus
+ * the handler either way, so the import's cost moves rather than disappears.
+ * What it removes is the warm-but-never-dispatched case above.
+ */
+const lambdaSdk = import("@aws-sdk/client-lambda").then(
+  (mod) => ({ client: new mod.LambdaClient({}), InvokeCommand: mod.InvokeCommand }),
+  (error) => ({ error }),
+);
+
+/** Per-container cache, populated from the INIT-time promise on first use. */
 let lambdaClient;
 
 /**
@@ -261,11 +295,17 @@ async function dispatchAsync(messages, logger = console) {
 
   try {
     if (!lambdaClient) {
-      // Dynamic, and inside the try, on purpose: @aws-sdk/client-lambda ships
-      // with the nodejs20.x runtime but is not a dependency of this package, so
-      // a context without it must degrade to inline rather than fail at import.
-      const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
-      lambdaClient = { client: new LambdaClient({}), InvokeCommand };
+      // Already resolved in every realistic case: the load was started at INIT
+      // (see lambdaSdk above), so this await is a microtask, not a 2.8s import.
+      const settled = await lambdaSdk;
+      if (settled.error) {
+        return {
+          dispatched: false,
+          reason: `@aws-sdk/client-lambda unavailable: ` +
+            `${settled.error.message ?? settled.error}`,
+        };
+      }
+      lambdaClient = settled;
     }
 
     const { client, InvokeCommand } = lambdaClient;

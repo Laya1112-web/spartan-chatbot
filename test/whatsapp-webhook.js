@@ -632,6 +632,23 @@ async function main() {
   }
 
   {
+    // The SDK is loaded at INIT (module scope) and only exists inside the
+    // nodejs20.x runtime, so here it is always absent — which makes the
+    // degradation path directly testable rather than hypothetical.
+    reset(); world();
+    const savedAsync = process.env.WHATSAPP_ASYNC;
+    delete process.env.WHATSAPP_ASYNC;
+    process.env.AWS_LAMBDA_FUNCTION_NAME = "spartan-chatbot";
+    const out = await quietly(() => dispatchAsync([{ waId: WA_ID, wamid: "w", text: "hi" }]));
+    delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+    process.env.WHATSAPP_ASYNC = savedAsync;
+    check("SDK missing -> dispatch degrades with a named reason, never throws",
+      out.dispatched === false && /@aws-sdk\/client-lambda unavailable/.test(out.reason));
+    check("the INIT-time SDK promise never rejects (no unhandled rejection at load)",
+      typeof out.reason === "string" && out.reason.length > 0);
+  }
+
+  {
     reset();
     const state = world({ conversation: null });
     const res = await post(textEvent({ wamid: "wamid.INLINE" }));
