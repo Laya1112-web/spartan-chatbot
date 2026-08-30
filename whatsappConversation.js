@@ -40,6 +40,7 @@ import {
   DIRECTION_OUTBOUND,
 } from "./conversation.js";
 import { MAX_MESSAGES, MAX_CONTENT_CHARS } from "./botBrain.js";
+import { integrationUserId } from "./salesforce.js";
 
 const CONVERSATION_OBJECT = "Conversation__c";
 const MESSAGE_OBJECT = "Message__c";
@@ -162,14 +163,140 @@ async function getConversationById(conversationId, auth, logger = console) {
   };
 }
 
+/** How a rep's message is shown to the model: quoted, attributed, not its own. */
+const REP_TURN_LABEL = "A Spartan specialist replied here";
+
+function renderRepTurn(text) {
+  return `[${REP_TURN_LABEL}: "${text}"]`;
+}
+
+/**
+ * The integration user's id, or null when it cannot be established.
+ *
+ * READ THIS BEFORE "FIXING" THE NULL CASE TO MATCH conversation.js.
+ *
+ * conversation.js's poll SUPPRESSES everything when this is null, and that is
+ * right for the poll: its null-failure is user-visible and harmful — unfiltered
+ * Outbound replays the bot's own replies into the widget as though a rep had
+ * just typed them. The visitor sees it.
+ *
+ * History is the opposite case, so it makes the opposite choice DELIBERATELY.
+ * Its null-failure is invisible and stylistic: the worst outcome is that rep
+ * lines keep being replayed as assistant turns, which is precisely today's
+ * behaviour and the bug we are narrowing — not a regression. Suppressing
+ * instead would hand the model NO history at all, so it would greet a visitor
+ * mid-conversation as though they had never written. No history is far worse
+ * than imperfect history.
+ *
+ * So: degrade to "all Outbound is assistant" and log loudly. Do not make this
+ * suppress. If you are here because the two files disagree, they are supposed
+ * to.
+ */
+async function resolveBotUserId(auth, logger = console) {
+  try {
+    // fetchTranscript is called with a session (has .get()) on the live path and
+    // occasionally with a plain auth object in tests; both are accepted.
+    const resolved = auth && typeof auth.get === "function" ? await auth.get() : auth;
+    const botUserId = integrationUserId(resolved);
+    if (botUserId) return botUserId;
+  } catch (error) {
+    logger.error(
+      `[whatsapp] transcript could not resolve the integration user: ` +
+      `${error && error.message ? error.message : error}`,
+    );
+    return null;
+  }
+
+  logger.error(
+    "[whatsapp] transcript cannot identify the integration user, so a rep's " +
+    "messages cannot be told from the bot's own. Falling back to replaying ALL " +
+    "Outbound as assistant turns — the model may imitate a rep's phrasing. " +
+    "This degrades tone, not correctness, and is preferred to answering with no " +
+    "history at all. Set SF_INTEGRATION_USER_ID to fix.",
+  );
+  return null;
+}
+
+/** How many recent Inbound rows the burst election looks at. */
+const ELECTION_WINDOW = 10;
+
+/**
+ * The most recent Inbound message ids on a conversation, NEWEST FIRST.
+ *
+ * Returns a list rather than just the winner, and that is the whole point.
+ * Asking only for the newest id and comparing it to your own forces you to read
+ * "different id" as "someone newer exists" — but it also reads that way when
+ * your OWN row simply is not visible yet, which Salesforce does not promise it
+ * will be immediately after the write returns. Under that lag every job in a
+ * burst would yield to a row older than itself and the visitor would get no
+ * reply at all. A list lets the caller tell the two cases apart: absent means
+ * "cannot place myself, so answer", index > 0 means "genuinely superseded".
+ *
+ * The order is `Sent_At__c DESC, Id DESC`. Message__c does NOT store the wamid
+ * — writeMessage in conversation.js persists Body__c, Direction__c, Read__c and
+ * Sent_At__c only — so the record Id stands in as the tiebreak. Salesforce ids
+ * are not chronologically monotonic, which does not matter here: the election
+ * needs every racing job to derive the SAME order from the same rows, and a
+ * stable total order is enough. Chronology is carried by Sent_At__c.
+ *
+ * Never throws. An empty list means "cannot elect", and the caller must then
+ * proceed rather than yield — see yieldToNewerInbound in whatsappWebhook.js.
+ */
+async function recentInboundIds({
+  conversationId, auth, limit = ELECTION_WINDOW, logger = console,
+}) {
+  if (!SF_ID_RE.test(String(conversationId ?? ""))) return [];
+
+  try {
+    const soql =
+      `SELECT Id FROM ${MESSAGE_OBJECT} ` +
+      `WHERE Conversation__c = '${conversationId}' ` +
+      `AND Direction__c = '${DIRECTION_INBOUND}' ` +
+      `ORDER BY Sent_At__c DESC NULLS LAST, Id DESC ` +
+      `LIMIT ${Number(limit) || ELECTION_WINDOW}`;
+
+    const { body } = await sfRequest(auth, `/query/?q=${encodeURIComponent(soql)}`);
+    const records = Array.isArray(body?.records) ? body.records : [];
+    return records
+      .map((r) => (r && typeof r.Id === "string" ? r.Id : null))
+      .filter(Boolean);
+  } catch (error) {
+    logger.error(
+      `[whatsapp] inbound election read failed conversation=${conversationId}: ` +
+      `${error && error.message ? error.message : error}`,
+    );
+    return [];
+  }
+}
+
 /**
  * The thread so far, oldest first, in the shape the Messages API wants.
  *
- * Inbound becomes a user turn, Outbound an assistant turn — which means a rep's
- * replies, written Outbound by the rep in Salesforce, come back as assistant
- * turns too. That is correct and deliberate: when a rep hands the thread back,
- * the bot resumes knowing what the rep already said instead of asking the
- * visitor to repeat it.
+ * WHO SAID IT DECIDES THE ROLE, not merely which direction it went.
+ *
+ * Inbound is always a user turn. Outbound splits by author, because the
+ * Messages API has exactly two roles and anything placed in `assistant` IS the
+ * model's own voice by construction — there is no instruction that undoes that.
+ * A rep's Outbound replayed as `assistant` therefore does not read to the model
+ * as context; it reads as its own prior register, and it copies it. That is a
+ * real defect seen in production: replies went clipped and scripted because the
+ * thread contained hand-typed rep lines like "Hello! Are you interested in
+ * Business Funding?" and the model matched that voice.
+ *
+ * So a rep's Outbound comes back as ATTRIBUTED CONTEXT inside a user turn —
+ * something the model reports on rather than continues. The bot still resumes
+ * knowing what the rep already said (it must, or it re-asks what was answered
+ * and contradicts what was promised); it just no longer mistakes it for itself.
+ *
+ * CreatedById is the discriminator, and it is trustworthy here by design:
+ * whatsappOutbound.js deliberately does NOT write Message__c for a rep send —
+ * Salesforce does, under the rep's own User id. See decision 1 in that file
+ * before changing this.
+ *
+ * ONE WRINKLE, historical. Messages written before the 2026-08-27 integration
+ * user switch were authored by a person (Laya), so the bot's own replies from
+ * before that date classify as rep turns here. Only the pre-switch test thread
+ * was affected and it was retired; no live thread carries pre-switch rows.
  *
  * Newest-first with a LIMIT and then reversed, so a very long thread hands the
  * model its most recent window rather than its oldest.
@@ -191,26 +318,55 @@ async function fetchTranscript({ conversationId, auth, limit = TRANSCRIPT_LIMIT,
 
   try {
     const soql =
-      `SELECT Id, Body__c, Direction__c, Sent_At__c, CreatedDate FROM ${MESSAGE_OBJECT} ` +
+      `SELECT Id, Body__c, Direction__c, Sent_At__c, CreatedDate, CreatedById FROM ${MESSAGE_OBJECT} ` +
       `WHERE Conversation__c = '${conversationId}' ` +
       `ORDER BY Sent_At__c DESC NULLS LAST LIMIT ${Number(limit) || TRANSCRIPT_LIMIT}`;
 
     const { body } = await sfRequest(auth, `/query/?q=${encodeURIComponent(soql)}`);
     const records = Array.isArray(body?.records) ? body.records.slice().reverse() : [];
 
+    const botUserId = await resolveBotUserId(auth, logger);
+
     const turns = [];
     for (const record of records) {
       const content = typeof record?.Body__c === "string" ? record.Body__c.trim() : "";
       if (!content) continue;
-      const role = record.Direction__c === DIRECTION_OUTBOUND ? "assistant" : "user";
-      turns.push({ role, content: content.slice(0, MAX_CONTENT_CHARS) });
+      const clipped = content.slice(0, MAX_CONTENT_CHARS);
+
+      if (record.Direction__c !== DIRECTION_OUTBOUND) {
+        turns.push({ role: "user", content: clipped });
+        continue;
+      }
+
+      // Outbound. A known author that is NOT the integration user is a rep.
+      // With botUserId null we cannot tell, and the fallback below is the
+      // deliberate one: everything stays `assistant`, exactly as before.
+      const author = typeof record.CreatedById === "string" ? record.CreatedById : "";
+      if (botUserId && author && author !== botUserId) {
+        turns.push({ role: "user", content: renderRepTurn(clipped) });
+      } else {
+        turns.push({ role: "assistant", content: clipped });
+      }
+    }
+
+    // Consecutive same-role turns are folded together. A burst of quick texts
+    // and a rep line sitting next to the visitor's own words both produce them,
+    // and one turn per speaker is what the Messages API is happiest with.
+    const merged = [];
+    for (const turn of turns) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === turn.role) {
+        last.content = `${last.content}\n\n${turn.content}`;
+      } else {
+        merged.push({ ...turn });
+      }
     }
 
     // The Messages API requires the first turn to be from the user, so drop any
     // leading assistant turns — which is what a thread whose window opens just
     // after a bot reply looks like.
-    const firstUser = turns.findIndex((t) => t.role === "user");
-    return firstUser === -1 ? [] : turns.slice(firstUser);
+    const firstUser = merged.findIndex((t) => t.role === "user");
+    return firstUser === -1 ? [] : merged.slice(firstUser);
   } catch (error) {
     logger.error(
       `[whatsapp] transcript read failed conversation=${conversationId}: ` +
@@ -415,6 +571,10 @@ export {
   getConversationById,
   ensureWhatsAppConversation,
   fetchTranscript,
+  recentInboundIds,
+  ELECTION_WINDOW,
+  renderRepTurn,
+  REP_TURN_LABEL,
   stampInbound,
   attachLead,
   recordWhatsAppMessage,

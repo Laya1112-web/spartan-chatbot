@@ -36,6 +36,10 @@ delete process.env.WIDGET_TOKEN;
 process.env.WHATSAPP_PHONE_NUMBER_ID = "1240388075832660";
 process.env.WHATSAPP_ACCESS_TOKEN = "EAAG_test_token";
 process.env.WHATSAPP_VERIFY_TOKEN = "test-verify-token-9f3a";
+// The burst debounce is exercised here (the election still runs) but its wait
+// is dropped to 1ms: this suite is about the webhook, and test/whatsapp-burst.js
+// owns the debounce behaviour itself.
+process.env.WHATSAPP_BURST_DEBOUNCE_MS = "1";
 process.env.WHATSAPP_APP_SECRET = "test-app-secret-abc123";
 // Force the inline path: the async self-invoke needs a real Lambda around it.
 process.env.WHATSAPP_ASYNC = "false";

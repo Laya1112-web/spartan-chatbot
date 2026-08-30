@@ -83,6 +83,7 @@ import {
 import {
   ensureWhatsAppConversation,
   fetchTranscript,
+  recentInboundIds,
   stampInbound,
   attachLead,
   recordWhatsAppMessage,
@@ -98,6 +99,23 @@ const JOB_KEY = "whatsappJob";
 
 /** Messages carried in one async job. A bound, not an expected batch size. */
 const MAX_JOB_MESSAGES = 20;
+
+/**
+ * How long a job waits to see whether the visitor is still typing.
+ *
+ * People text in bursts — "Hi", then "I need funding" a second later. Meta
+ * delivers each as its OWN webhook POST, so each becomes its own job on its own
+ * container, and neither can see the other's reply. Both answer the thread as
+ * they found it and the visitor gets two replies that ignore each other. That
+ * is what produced "Hi there! How can I help you?" landing after "What is your
+ * first name?" in the 848 thread on 2026-08-30.
+ *
+ * ~1.5s is about the gap a person leaves between two quick texts, and it is
+ * cheap next to the ~2.8s cold start already on this path. Tunable at runtime
+ * with WHATSAPP_BURST_DEBOUNCE_MS; 0 disables the wait entirely and restores
+ * the previous one-reply-per-message behaviour.
+ */
+const BURST_DEBOUNCE_MS = 1500;
 
 /* ------------------------------------------------------------------ *
  * Routing
@@ -424,6 +442,82 @@ function clearWhatsAppMemory() {
  *
  * @returns {Promise<object>} a summary for the log; nothing consumes it.
  */
+/** Promise-based sleep; injectable so tests do not actually wait. */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wait out a burst, and decide whether THIS job is the one that should answer.
+ *
+ * WHERE THIS SITS RELATIVE TO META'S 200. Entirely after it. The webhook
+ * handler returns at STEP 5 the moment dispatchAsync has queued the Event
+ * invocation; everything here runs in that second invocation, so the wait is
+ * invisible to Meta and the 200-fast design is untouched. Never move this into
+ * handleWhatsAppRequest.
+ *
+ * THE ELECTION IS LOCK-FREE. Every job in a burst reads the same recent Inbound
+ * rows in the same total order, so they independently agree on one winner
+ * without a lock, a table, or any shared state. Losers return quietly; the
+ * winner's transcript read then contains the WHOLE burst as consecutive user
+ * turns, and it answers all of it at once.
+ *
+ * IT YIELDS ONLY ON POSITIVE EVIDENCE OF BEING SUPERSEDED — this job's own row
+ * present in the list with something newer above it. Anything else answers.
+ * That asymmetry is deliberate and is the difference between a duplicate reply
+ * and NO reply: Salesforce does not promise a row is queryable the instant its
+ * write returns, and "my id is not the newest id" is also what that lag looks
+ * like. Yielding on it would let every job in a burst defer to a row older than
+ * itself and leave the visitor with silence.
+ *
+ * EVERY FAILURE PATH PROCEEDS RATHER THAN YIELDS. A missing row id, a failed
+ * query, an empty list, an id we cannot find, a disabled window: all return
+ * false, and the job answers exactly as it would have before this existed. The
+ * worst case is the old double-reply, never silence.
+ *
+ * @returns {Promise<boolean>} true when a newer inbound exists and this job
+ *   should stop without calling the model.
+ */
+async function yieldToNewerInbound({
+  conversationId, myInboundId, auth, logger = console, deps = {},
+}) {
+  const ms = Number(process.env.WHATSAPP_BURST_DEBOUNCE_MS ?? BURST_DEBOUNCE_MS);
+  if (!Number.isFinite(ms) || ms <= 0) return false;
+
+  // No row id means the inbound write failed. We cannot tell whether we are the
+  // newest, so we answer: a burst with no reply is worse than a duplicated one.
+  if (!myInboundId) return false;
+
+  await (deps.sleep || sleep)(ms);
+
+  const ids = await (deps.recentInboundIds || recentInboundIds)({
+    conversationId, auth, logger,
+  });
+  if (!ids.length) return false;
+
+  const position = ids.indexOf(myInboundId);
+
+  // Not in the window at all: either the write is not visible yet, or the burst
+  // is longer than the window. Either way we cannot prove we were superseded,
+  // so we answer.
+  if (position === -1) {
+    logger.warn(
+      `whatsapp: burst debounce could not locate inbound ${myInboundId} among ` +
+      `${ids.length} recent inbound row(s) on ${conversationId}; answering rather ` +
+      `than risking a turn nobody replies to`,
+    );
+    return false;
+  }
+
+  if (position === 0) return false; // newest: this job answers the whole burst
+
+  logger.log(
+    `whatsapp: burst debounce — ${position} newer inbound(s) supersede ` +
+    `${myInboundId}, yielding conversation=${conversationId}`,
+  );
+  return true;
+}
+
 async function processWhatsAppMessage(message, { logger = console, deps = {} } = {}) {
   const { waId, wamid, text, profileName, timestamp, type } = message ?? {};
   if (!waId) return { skipped: "no-wa-id" };
@@ -517,26 +611,52 @@ async function processWhatsAppMessage(message, { logger = console, deps = {} } =
     return { ...summary, live: true };
   }
 
+  /* --- Record the inbound, then wait out the burst ----------------- */
+
+  // ORDER REVERSED DELIBERATELY. This used to read the transcript BEFORE
+  // writing the inbound and then append this turn's text by hand. The write now
+  // comes first, because the debounce below elects a winner from the Inbound
+  // rows in Salesforce — this message has to be one of them to be counted, and
+  // the winner's later transcript read is what picks the whole burst up.
+  let myInboundId = null;
+  if (conversation) {
+    const written = await recordWhatsAppMessage({
+      conversationId: conversation.id, body: text,
+      direction: DIRECTION_INBOUND, auth: session, logger, deps,
+    });
+    myInboundId = written && typeof written.id === "string" ? written.id : null;
+    await stampInbound({ conversationId: conversation.id, at, auth: session, logger });
+
+    const yielded = await yieldToNewerInbound({
+      conversationId: conversation.id, myInboundId, auth: session, logger, deps,
+    });
+    if (yielded) return { ...summary, yielded: true };
+  }
+
   /* --- The thread so far ------------------------------------------ */
 
-  // Read BEFORE the inbound is written, so this turn's message is appended
-  // exactly once and cannot race its own Sent_At__c ordering.
+  // Contains this turn's message already: it was written above. Appending it
+  // again here is the bug to avoid if you touch this.
   const history = conversation
     ? await fetchTranscript({ conversationId: conversation.id, auth: session, logger })
     : [];
 
-  if (conversation) {
-    await recordWhatsAppMessage({
-      conversationId: conversation.id, body: text,
-      direction: DIRECTION_INBOUND, auth: session, logger, deps,
-    });
-    await stampInbound({ conversationId: conversation.id, at, auth: session, logger });
-  }
+  // THIS TURN MUST BE IN THE THREAD, whatever the transcript did. Normally it
+  // is: it was written above and comes back as the last user turn. But a
+  // transcript read that failed and degraded to [], or one taken before the
+  // write was queryable, would otherwise have the bot answer the conversation
+  // as it stood BEFORE the visitor's newest message — replying confidently to
+  // the wrong thing, which is worse than any duplication. So it is appended
+  // unless it is demonstrably already there.
+  const currentText = String(text).slice(0, MAX_CONTENT_CHARS);
+  const tail = history[history.length - 1];
+  const alreadyPresent =
+    Boolean(tail) && tail.role === "user" && tail.content.includes(currentText);
 
-  const messages = [
-    ...history,
-    { role: "user", content: String(text).slice(0, MAX_CONTENT_CHARS) },
-  ].slice(-MAX_MESSAGES);
+  const messages = (alreadyPresent
+    ? history
+    : [...history, { role: "user", content: currentText }]
+  ).slice(-MAX_MESSAGES);
 
   /* --- The AI turn ------------------------------------------------ */
 
@@ -727,6 +847,8 @@ export {
   processWhatsAppMessage,
   processWhatsAppMessages,
   dispatchAsync,
+  yieldToNewerInbound,
+  BURST_DEBOUNCE_MS,
   clearWhatsAppMemory,
   JOB_KEY,
   MAX_JOB_MESSAGES,
