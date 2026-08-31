@@ -381,11 +381,40 @@ async function fetchTranscript({ conversationId, auth, limit = TRANSCRIPT_LIMIT,
  * ------------------------------------------------------------------ */
 
 /**
+ * A DUPLICATE_VALUE rejection, and the unique field that caused it.
+ *
+ * Salesforce reports these as
+ *   [{"message":"duplicate value found: Session_Id__c duplicates value on
+ *     record with id: a3I...","errorCode":"DUPLICATE_VALUE"}]
+ * and sfRequest carries that body through verbatim in error.message.
+ *
+ * This matters because the optional-field retry below CANNOT fix a duplicate
+ * key — the collision is on a required field — so without this the real cause
+ * is buried under a misleading "check Whatsapp_Phone__c in the org" line.
+ * That is exactly what happened on 2026-08-31: a retired thread still held
+ * Session_Id__c 'wa:<wa_id>', every create collided, and the turns were lost
+ * while the log blamed an optional column.
+ */
+function duplicateKeyField(error) {
+  const message = error && error.message ? String(error.message) : "";
+  if (!message.includes("DUPLICATE_VALUE") && !message.includes("duplicate value found")) {
+    return null;
+  }
+  const named = message.match(/duplicate value found:\s*([A-Za-z0-9_]+__c)/);
+  const holder = message.match(/record with id:\s*([A-Za-z0-9]+)/);
+  return { field: named ? named[1] : "unknown", holder: holder ? holder[1] : null };
+}
+
+/**
  * PATCH a conversation, dropping the org-dependent fields if Salesforce
  * rejects them.
  *
  * One retry, required fields only. An org missing Whatsapp_Phone__c must cost
  * us that column, never the conversation.
+ *
+ * A unique-key collision is reported as itself and rethrown instead: the retry
+ * is provably useless there, and the caller logging "resolve failed" needs the
+ * real reason in the line above it.
  */
 async function writeConversation(path, fields, auth, logger) {
   const required = {};
@@ -398,6 +427,19 @@ async function writeConversation(path, fields, auth, logger) {
   try {
     return await sfRequest(auth, path, { method: "PATCH", body: { ...required, ...optional } });
   } catch (error) {
+    const duplicate = duplicateKeyField(error);
+    if (duplicate) {
+      logger.error(
+        `[whatsapp] conversation write hit a UNIQUE constraint on ` +
+        `${duplicate.field}` +
+        (duplicate.holder ? ` — already held by record ${duplicate.holder}` : "") +
+        `. This is NOT an optional-field problem and no retry can clear it: ` +
+        `release that key on the holding record (a retired thread must give up ` +
+        `BOTH Whatsapp_Wa_Id__c and Session_Id__c). ` +
+        `${error && error.message ? error.message : error}`,
+      );
+      throw error;
+    }
     if (!Object.keys(optional).length) throw error;
     logger.error(
       `[whatsapp] conversation write rejected with optional fields ` +

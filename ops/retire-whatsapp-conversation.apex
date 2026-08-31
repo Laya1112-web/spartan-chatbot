@@ -24,6 +24,26 @@
  * 404s, and the inbound path creates a genuinely fresh Conversation__c.
  *
  * ---------------------------------------------------------------------------
+ * RELEASE BOTH KEYS — the 2026-08-31 near-miss
+ * ---------------------------------------------------------------------------
+ * Conversation__c has TWO unique keys that a WhatsApp thread occupies, and
+ * releasing only one is worse than releasing neither:
+ *
+ *     Whatsapp_Wa_Id__c  '17323975063'      the inbound lookup key
+ *     Session_Id__c      'wa:17323975063'   set on create by
+ *                                           whatsappConversation.js
+ *
+ * The first run of this script released only the wa_id. The lookup duly 404'd,
+ * so the inbound path tried to CREATE — and the create collided with the
+ * retired record on Session_Id__c:
+ *
+ *     DUPLICATE_VALUE: Session_Id__c duplicates value on record with id: <retired>
+ *
+ * The bot still replied (from empty context), but no Conversation__c and no
+ * Message__c were written. Every inbound from that phone was silently lost
+ * until Session_Id__c was released too. Release both, and assert on both.
+ *
+ * ---------------------------------------------------------------------------
  * WHY RETIRE RATHER THAN DELETE
  * ---------------------------------------------------------------------------
  * Delete would cascade the 19 Message__c children and destroy the only record
@@ -41,10 +61,15 @@ Boolean DRY_RUN = true;
 
 final Id    CONV_ID    = 'a3IVr000002No9RMAS';
 final String LIVE_WAID = '17323975063';
-final String RETIRED   = LIVE_WAID + '-retired-' + Datetime.now().format('yyyyMMdd');
+final String SUFFIX    = '-retired-' + Datetime.now().format('yyyyMMdd');
+final String RETIRED   = LIVE_WAID + SUFFIX;
+
+// BOTH unique keys must be released, not just the wa_id. See the header note.
+final String LIVE_SESSION    = 'wa:' + LIVE_WAID;
+final String RETIRED_SESSION = 'wa:' + LIVE_WAID + SUFFIX;
 
 List<Conversation__c> found = [
-    SELECT Id, Whatsapp_Wa_Id__c, Status__c, Channel__c, Lead__c, CreatedDate
+    SELECT Id, Whatsapp_Wa_Id__c, Session_Id__c, Status__c, Channel__c, Lead__c, CreatedDate
     FROM Conversation__c
     WHERE Id = :CONV_ID
 ];
@@ -69,6 +94,7 @@ Integer msgCount = [SELECT COUNT() FROM Message__c WHERE Conversation__c = :CONV
 System.debug('=== BEFORE ===');
 System.debug('  Id            : ' + c.Id);
 System.debug('  Whatsapp_Wa_Id: ' + c.Whatsapp_Wa_Id__c);
+System.debug('  Session_Id    : ' + c.Session_Id__c);
 System.debug('  Status        : ' + c.Status__c);
 System.debug('  Channel       : ' + c.Channel__c);
 System.debug('  Created       : ' + c.CreatedDate);
@@ -76,6 +102,7 @@ System.debug('  Message__c    : ' + msgCount + ' row(s) — retained, not delete
 System.debug('=== WOULD APPLY ===');
 System.debug('  Status__c        -> Closed');
 System.debug('  Whatsapp_Wa_Id__c -> ' + RETIRED);
+System.debug('  Session_Id__c     -> ' + RETIRED_SESSION);
 
 if (DRY_RUN) {
     System.debug('DRY RUN: nothing written. Set DRY_RUN = false to apply.');
@@ -84,6 +111,7 @@ if (DRY_RUN) {
 
 c.Status__c = 'Closed';
 c.Whatsapp_Wa_Id__c = RETIRED;
+c.Session_Id__c = RETIRED_SESSION;
 update c;
 
 // -------------------------------------------------------------------------
@@ -93,18 +121,30 @@ update c;
 List<Conversation__c> stillLive = [
     SELECT Id, Status__c FROM Conversation__c WHERE Whatsapp_Wa_Id__c = :LIVE_WAID
 ];
+List<Conversation__c> stillSession = [
+    SELECT Id, Status__c FROM Conversation__c WHERE Session_Id__c = :LIVE_SESSION
+];
 
 System.debug('=== AFTER ===');
 System.debug('  retired record : ' + c.Id + ' status=' + c.Status__c +
-             ' wa_id=' + c.Whatsapp_Wa_Id__c);
+             ' wa_id=' + c.Whatsapp_Wa_Id__c +
+             ' session=' + c.Session_Id__c);
 System.debug('  Message__c kept: ' +
              [SELECT COUNT() FROM Message__c WHERE Conversation__c = :CONV_ID]);
 
-if (stillLive.isEmpty()) {
-    System.debug('PASS: no conversation holds ' + LIVE_WAID +
-                 ' any more. The next inbound from that phone starts a FRESH thread.');
-} else {
+if (!stillLive.isEmpty()) {
     System.debug(LoggingLevel.ERROR,
         'FAIL: ' + stillLive.size() + ' conversation(s) still hold ' + LIVE_WAID +
         ' — the next inbound will land on one of them: ' + stillLive);
+} else if (!stillSession.isEmpty()) {
+    // The blind spot that made a half-done retirement report PASS on
+    // 2026-08-31: the wa_id was released but Session_Id__c was not, so the
+    // create collided with DUPLICATE_VALUE and every inbound was dropped.
+    System.debug(LoggingLevel.ERROR,
+        'FAIL: wa_id is free but ' + stillSession.size() + ' conversation(s) still hold ' +
+        LIVE_SESSION + ' — the create will die with DUPLICATE_VALUE on Session_Id__c ' +
+        'and inbound turns will be LOST: ' + stillSession);
+} else {
+    System.debug('PASS: no conversation holds ' + LIVE_WAID + ' or ' + LIVE_SESSION +
+                 ' any more. The next inbound from that phone starts a FRESH thread.');
 }
