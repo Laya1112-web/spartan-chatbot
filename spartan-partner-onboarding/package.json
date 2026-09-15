@@ -1,0 +1,19 @@
+{
+  "name": "spartan-partner-onboarding",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AWS Lambda (Function URL) receiver for the Spartan Capital Group partner (ISO) onboarding form",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "rm -rf build function.zip && mkdir -p build && cp index.js fields.js storage.js notify.js sharepoint.js package.json package-lock.json build/ && npm ci --omit=dev --prefix build && cd build && zip -qr ../function.zip . && cd .. && rm -rf build",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1132.0",
+    "@aws-sdk/client-ses": "^3.1132.0"
+  }
+}
