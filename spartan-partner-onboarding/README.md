@@ -86,6 +86,32 @@ The map is accurate today, but the form has already been revised once — when t
 next field is added and this file has not caught up, the reader still sees the
 value instead of the submission silently losing it.
 
+### The one exception: `REMOVED_FIELDS`
+
+The retired Background keys are the single deliberate exception to that
+guarantee. `index.js` strips `bg_bankruptcy`, `bg_bankruptcy_detail`,
+`bg_liens`, `bg_liens_detail`, `bg_judgements`, `bg_judgements_detail`,
+`bg_criminal`, `bg_criminal_detail`, and `rbf_notes` at ingest — after
+validation, before the S3 write — so they are never stored and never emailed.
+
+This gate exists because the `Additional Fields` fallback would otherwise print
+them: removing the questions from the form is not enough on its own, since a
+stale cached copy of the old page, or someone re-adding the fields, would
+quietly resume collecting answers the business decided on 2026-09-15 to stop
+holding. The strip has to live in code for the decision to actually hold.
+
+A submission carrying any of them is still accepted — the rest of the packet is
+worth keeping — and logs once:
+
+```
+spartan-partner-onboarding: stripped removed fields  { id, fields: [...] }
+```
+
+That line is the signal that a stale page is still live somewhere; it is worth
+a CloudWatch metric filter. Deleting an entry from `REMOVED_FIELDS` re-enables
+storage of that field, so treat the list as the record of a business decision,
+not as a tidy-up.
+
 ## Storage layout
 
 ```

@@ -34,6 +34,11 @@
  * is worth storing and reviewing, and rejecting it would send the partner away
  * with nothing.
  *
+ * The one thing that IS filtered is REMOVED_FIELDS: the retired Background
+ * questions are dropped at ingest, before the write, so they are never stored
+ * even if a stale page still sends them. See the constant for why that gate
+ * lives here rather than being left to the form.
+ *
  * Runtime: nodejs20.x   Region: us-east-1 (bucket is us-east-2 -- see storage.js)
  */
 
@@ -45,6 +50,37 @@ import { relayToSharePoint } from "./sharepoint.js";
 
 /** The action this endpoint exists to serve. */
 const ONBOARDING_ACTION = "partner_onboarding";
+
+/**
+ * Fields the business stopped collecting.
+ *
+ * The Background section -- bankruptcies, liens, judgements, criminal history,
+ * and the RBF notes -- was removed from the partner onboarding form on
+ * 2026-09-15 at the business's request. These keys are stripped from every
+ * submission at ingest, before anything is stored or emailed.
+ *
+ * The strip is a deliberate GATE, not a tidy-up. fields.js already has no label
+ * for these keys, but it prints unrecognized keys under "Additional Fields" by
+ * design -- so without this list, a stale cached copy of the old page, or
+ * someone re-adding the questions to the form, would quietly resume storing
+ * answers the business decided to stop holding. Removing them from the form is
+ * not sufficient; they also have to be removed HERE. That is the point of
+ * keeping the list in code rather than trusting the form to stop sending them.
+ *
+ * Deleting an entry from this list re-enables storage of that field. Do that
+ * only on the same authority that removed it.
+ */
+const REMOVED_FIELDS = [
+  "bg_bankruptcy",
+  "bg_bankruptcy_detail",
+  "bg_liens",
+  "bg_liens_detail",
+  "bg_judgements",
+  "bg_judgements_detail",
+  "bg_criminal",
+  "bg_criminal_detail",
+  "rbf_notes",
+];
 
 /** Shown to the browser when the S3 write fails. No internals leak. */
 const GENERIC_ERROR = "Sorry — we could not save your submission. Please try again in a moment.";
@@ -78,17 +114,23 @@ export const handler = async (event) => {
       });
     }
 
-    const lead = body.lead;
+    const submitted = body.lead;
 
-    if (!lead || typeof lead !== "object" || Array.isArray(lead)) {
+    if (!submitted || typeof submitted !== "object" || Array.isArray(submitted)) {
       return json(400, headers, { success: false, error: "`lead` is required." });
     }
 
     // The single required field. Everything else on the form is optional and is
     // stored as submitted, however sparse.
-    if (!present(lead.owner_email)) {
+    if (!present(submitted.owner_email)) {
       return json(400, headers, { success: false, error: "`lead.owner_email` is required." });
     }
+
+    // Validated, so now drop the retired Background fields -- before the S3
+    // write, so they are never stored, and before the notification, which reads
+    // the same object. A stale page sending them is logged, not rejected: the
+    // rest of the packet is still worth keeping.
+    const lead = stripRemovedFields(submitted, id);
 
     const receivedAt = new Date().toISOString();
     const sourceIp = event?.requestContext?.http?.sourceIp ?? null;
@@ -235,6 +277,33 @@ function parseBody(event) {
   }
 
   return parsed;
+}
+
+/**
+ * Return a copy of the submission with every REMOVED_FIELDS key dropped.
+ *
+ * Copies rather than mutating: the parsed body stays intact for anything that
+ * inspects it later, and the object handed to storage and notify is provably
+ * the filtered one. A key present but empty still counts as stripped -- the
+ * form sent it, which is the signal worth logging.
+ *
+ * Warns once per submission, listing the keys, so a stale page still live
+ * somewhere is visible in CloudWatch instead of silently re-submitting retired
+ * questions. Never throws and never fails the request.
+ */
+function stripRemovedFields(lead, id) {
+  const stripped = REMOVED_FIELDS.filter((key) => Object.hasOwn(lead, key));
+
+  if (stripped.length === 0) return lead;
+
+  const kept = {};
+  for (const [key, value] of Object.entries(lead)) {
+    if (!stripped.includes(key)) kept[key] = value;
+  }
+
+  console.warn("spartan-partner-onboarding: stripped removed fields", { id, fields: stripped });
+
+  return kept;
 }
 
 /** Treat null/undefined/'' (and whitespace-only) as absent. */
