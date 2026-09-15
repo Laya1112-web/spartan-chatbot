@@ -1,144 +1,138 @@
 /**
- * The field vocabulary for the partner onboarding form: which of the ~67 flat
- * keys belongs to which of the seven sections, and what each is called in the
- * notification email.
+ * The field vocabulary for the partner onboarding form: which of the form's
+ * flat keys belongs to which of the six sections, and what each is called in
+ * the notification email.
  *
  * This lives in its own module, and is pure data plus one pure renderer, for
  * the same reason leadHandoff.js is separate in spartan-chatbot: it is the part
  * most likely to change (a label reworded, a field added to the form) and the
  * part worth testing without an AWS account.
  *
- * THE RENDERER NEVER DROPS A FIELD.
+ * SECTIONS below is the REAL map, taken from the revised form -- it replaces
+ * the reconstruction this module shipped with. Two things changed with that
+ * revision and are worth stating so neither is reintroduced by accident:
  *
- * That is the whole design constraint here. This map was reconstructed from the
- * spec's three named keys (iso_legal, owner_name, owner_email) and the standard
- * shape of an ISO partner packet -- it has NOT been diffed against the live
- * form. So a key the form sends that is missing from this map must still reach
- * the reader, or a wrong guess in this file silently loses data, which is the
- * exact failure this project exists to eliminate. Unmapped keys are therefore
- * collected into a trailing "Additional Fields" section rather than skipped.
+ *   - Six sections, not seven.
+ *   - The Background section is GONE. Bankruptcies, liens, judgements,
+ *     criminal history and RBF notes are no longer collected, so no key and no
+ *     header for any of them exists here. They must not appear in the email.
  *
- * Fixing a label or moving a field between sections is a one-line edit here and
- * changes nothing else. Confirm SECTIONS against the real form before go-live;
- * until then the email is correct but its grouping is a best guess.
+ * THE RENDERER STILL NEVER DROPS A FIELD.
+ *
+ * Any key the form sends that is missing from this map is collected into a
+ * trailing "Additional Fields" section rather than skipped. The map is accurate
+ * today, but the form has already been revised once; when a field is added and
+ * this file has not caught up, the reader still sees the value instead of the
+ * submission silently losing it. That is the failure this function exists to
+ * eliminate, so the fallback stays.
  *
  * ESM, matching the rest of this function ("type": "module" in package.json).
  */
 
 /**
- * The seven sections, in the order the form presents them and the order the
+ * The six sections, in the order the form presents them and the order the
  * email prints them. Each entry lists its field keys in display order; the
  * value is the label printed to the left of the colon.
  */
 export const SECTIONS = [
   {
-    title: "ISO / Company Information",
+    title: "Your Information",
     fields: {
-      iso_legal: "Legal Business Name",
-      iso_dba: "DBA / Trade Name",
-      iso_entity_type: "Entity Type",
-      iso_ein: "EIN / Tax ID",
-      iso_date_established: "Date Established",
-      iso_state_incorporated: "State of Incorporation",
-      iso_website: "Website",
-      iso_years_in_industry: "Years in Industry",
-      iso_num_employees: "Number of Employees",
-      iso_num_sales_reps: "Number of Sales Reps",
-    },
-  },
-  {
-    title: "Business Address",
-    fields: {
-      address_street: "Street Address",
-      address_suite: "Suite / Unit",
-      address_city: "City",
-      address_state: "State",
-      address_zip: "ZIP Code",
-      address_country: "Country",
-      mailing_same_as_physical: "Mailing Address Same as Physical",
-      mailing_street: "Mailing Street",
-      mailing_city: "Mailing City",
-      mailing_state: "Mailing State",
-      mailing_zip: "Mailing ZIP",
-    },
-  },
-  {
-    title: "Ownership & Principals",
-    fields: {
-      owner_name: "Owner / Principal Name",
-      owner_title: "Title",
-      owner_email: "Owner Email",
+      iso_legal: "ISO Legal Name",
+      dba: "DBA Name",
+      ein: "EIN / Tax ID",
+      company_type: "Company Type",
+      state_inc: "State of Incorporation",
+      owner_name: "Owner Name",
       owner_phone: "Owner Phone",
-      owner_mobile: "Owner Mobile",
-      owner_ownership_pct: "Ownership %",
-      owner_dob: "Date of Birth",
-      owner_ssn_last4: "SSN (Last 4)",
-      owner_home_address: "Home Address",
-      owner_home_city: "Home City",
-      owner_home_state: "Home State",
-      owner_home_zip: "Home ZIP",
-      second_owner_name: "Second Owner Name",
-      second_owner_email: "Second Owner Email",
-      second_owner_phone: "Second Owner Phone",
-      second_owner_ownership_pct: "Second Owner Ownership %",
+      owner_email: "Owner Email",
+      biz_street: "Business Street",
+      biz_city: "City",
+      biz_state: "State",
+      biz_zip: "ZIP",
+      mpoc_name: "MPOC Name",
+      mpoc_email: "MPOC Email",
+      mpoc_phone: "MPOC Phone",
+      // Section 1's website field. Distinct from Section 6's `web_site`, which
+      // carries the same value -- see the note on printing both, below.
+      website: "Website",
+      has_owner2: "Second Owner?",
+      owner2_name: "Second Owner Name",
+      owner2_title: "Second Owner Title",
+      owner2_phone: "Second Owner Phone",
+      owner2_email: "Second Owner Email",
+      owner2_pct: "Second Owner Ownership %",
+      has_location2: "Additional Locations?",
+      loc2_street: "Location 2 Street",
+      loc2_city: "Location 2 City",
+      loc2_state: "Location 2 State",
+      loc2_zip: "Location 2 ZIP",
+      loc2_phone: "Location 2 Phone",
+      loc2_manager: "Location 2 Manager",
+      loc_additional: "Further Locations",
     },
   },
   {
-    title: "Primary Contact",
+    title: "Your Business",
     fields: {
-      contact_name: "Contact Name",
-      contact_title: "Contact Title",
-      contact_email: "Contact Email",
-      contact_phone: "Contact Phone",
-      contact_preferred_method: "Preferred Contact Method",
-      accounting_contact_name: "Accounting Contact",
-      accounting_contact_email: "Accounting Contact Email",
-      accounting_contact_phone: "Accounting Contact Phone",
+      time_in_business: "Time in Business",
+      funders_count: "Funders Worked With",
+      top_funders: "Top Funders",
+      inhouse_funding: "In-House Funding on Balance Sheet",
+      white_label: "White-Label Agreements",
+      reps_in_office: "Reps in Office",
     },
   },
   {
-    title: "Business Operations",
+    title: "Volume",
     fields: {
-      products_offered: "Products Offered",
-      monthly_submission_volume: "Monthly Submission Volume",
-      monthly_funded_volume: "Monthly Funded Volume",
-      average_deal_size: "Average Deal Size",
-      primary_industries: "Primary Industries Served",
-      lead_sources: "Lead Sources",
-      current_funding_partners: "Current Funding Partners",
-      states_operating: "States of Operation",
-      how_heard: "How Did You Hear About Us",
-      referred_by: "Referred By",
+      spartan_monthly_target: "Monthly Target with Spartan",
+      submissions_month: "Submissions per Month",
+      avg_volume_month: "Average Monthly Volume",
+      apps_month: "Applications per Month",
+      paper_a: "Paper Mix A %",
+      paper_b: "Paper Mix B %",
+      paper_c: "Paper Mix C %",
     },
   },
   {
-    title: "Banking & Commission",
+    // Every field in this section is a percentage.
+    title: "Lead Sources",
     fields: {
-      bank_name: "Bank Name",
-      bank_account_name: "Account Holder Name",
-      bank_account_last4: "Account Number (Last 4)",
-      bank_routing_last4: "Routing Number (Last 4)",
-      bank_account_type: "Account Type",
-      payment_method: "Commission Payment Method",
-      w9_on_file: "W-9 on File",
-      commission_notes: "Commission Notes",
+      src_packages: "Complete Packages",
+      src_press1: "Press-1 / Live Transfer",
+      src_paid: "Paid Search & Social",
+      src_ucc: "UCC / Aged",
+      src_mailers: "Mailers",
+      src_lender: "Lender-Supplied",
+      src_sms_email: "SMS / Email",
+      src_marketplace: "Marketplace",
     },
   },
   {
-    title: "Compliance & Agreement",
+    title: "Strategy",
     fields: {
-      licensed: "Licensed",
-      license_numbers: "License Numbers",
-      bankruptcy_history: "Bankruptcy History",
-      litigation_history: "Litigation History",
-      criminal_history: "Criminal History",
-      background_check_consent: "Background Check Consent",
-      agreement_accepted: "Agreement Accepted",
-      agreement_version: "Agreement Version",
-      signature_name: "Electronic Signature",
-      signature_date: "Signature Date",
-      signature_ip: "Signature IP",
-      additional_notes: "Additional Notes",
+      want_from_funder: "Wants From a Funder",
+      outreach_strategy: "Outreach Strategy",
+      scrub_method: "Scrubbing Method",
+      scrub_other: "Scrubbing — Other",
+      outside_partners: "Receives Outside Submissions",
+      outside_pct: "Outside Submissions %",
+      files_influenced: "Files Influenced By",
+    },
+  },
+  {
+    title: "Online Presence",
+    fields: {
+      // `web_site` deliberately duplicates Section 1's `website`: they are
+      // distinct keys carrying the same value, and BOTH are printed. Collapsing
+      // them would be this module quietly deciding the form is redundant, which
+      // is not its call to make.
+      web_site: "Website",
+      web_facebook: "Facebook",
+      web_instagram: "Instagram",
+      web_linkedin: "LinkedIn",
+      web_other: "Other",
     },
   },
 ];
@@ -151,8 +145,13 @@ const ENVELOPE_KEYS = new Set(["id", "received_at", "source_ip"]);
 
 /**
  * Treat null/undefined/'' (and whitespace-only) as absent, matching the
- * `present` helper in spartan-chatbot's leadHandoff.js. An absent optional
- * field is omitted from the email rather than printed as an empty label.
+ * `present` helper in spartan-chatbot's leadHandoff.js.
+ *
+ * This is what keeps the reveal fields clean. owner2_*, loc2_*, loc_additional,
+ * scrub_other and outside_pct are conditional on a Yes/No answer earlier in the
+ * form, and a partner who answered No still submits them -- as empty strings.
+ * Skipping absent values means the email shows "Second Owner? No" and then
+ * moves on, rather than six blank labels the reader has to scroll past.
  */
 function present(value) {
   if (value === null || value === undefined) return false;
@@ -168,10 +167,10 @@ function formatValue(value) {
 }
 
 /**
- * Turn a label into a fallback for an unmapped key: `iso_dba_name` reads as
- * "Iso Dba Name". Deliberately crude -- it only ever applies to keys this map
- * has not caught up with yet, and being readable matters more than being
- * pretty.
+ * Turn a key into a fallback label for an unmapped field: `some_new_field`
+ * reads as "Some New Field". Deliberately crude -- it only ever applies to keys
+ * this map has not caught up with yet, and being readable matters more than
+ * being pretty.
  */
 function humanize(key) {
   return String(key)

@@ -38,7 +38,7 @@ CloudWatch metric filter and an alarm.
 POST /
 Content-Type: application/json
 
-{ "action": "partner_onboarding", "lead": { … ~67 flat key/value fields … } }
+{ "action": "partner_onboarding", "lead": { … 63 flat key/value fields … } }
 ```
 
 `lead.owner_email` is the only required field. Everything else is optional and
@@ -53,20 +53,38 @@ storing and reviewing. A mislabelled `action` is logged, not rejected.
 | `storage.js` | The S3 write. Throws on failure by design — the only thing that can fail the request |
 | `notify.js` | SES notification. Logs and swallows its own errors |
 | `sharepoint.js` | Optional Power Automate relay. Skipped silently when unconfigured; never fails the request |
-| `fields.js` | Pure: the seven-section field map, the subject, and the plain-text body renderer |
+| `fields.js` | Pure: the six-section field map, the subject, and the plain-text body renderer |
 
-### ⚠️ Confirm the field map before go-live
+### The field map
 
-`fields.js` groups the form's keys into the seven sections and supplies the
-email labels. That map was reconstructed from the three field names in the spec
-(`iso_legal`, `owner_name`, `owner_email`) plus the standard shape of an ISO
-packet — **it has not been diffed against the live form.**
+`fields.js` holds the real map from the revised form: 63 fields across six
+sections — Your Information (30), Your Business (6), Volume (7), Lead Sources
+(8), Strategy (7), Online Presence (5).
 
-This is safe by construction: any submitted key the map does not know about is
-still printed, under a trailing `Additional Fields` section, so a wrong guess
-costs a misfiled label and never a lost field. Correcting one is a one-line edit
-in `fields.js` and changes nothing else. Do that pass once the real form's field
-list is available.
+Two things about the revision, stated here so neither is undone by accident:
+
+- **Six sections, not seven.** The earlier seven-section reconstruction is gone.
+- **The Background section was removed entirely.** Bankruptcies, liens,
+  judgements, criminal history and RBF notes are no longer collected. No key,
+  label, or header for any of them exists in the map, and none can appear in the
+  email.
+
+Two renderer behaviours the form depends on:
+
+- **Empty values are skipped.** The reveal fields (`owner2_*`, `loc2_*`,
+  `loc_additional`, `scrub_other`, `outside_pct`) are submitted as empty strings
+  when the partner answered No. The email shows `Second Owner?: No` and moves
+  on, rather than printing blank labels.
+- **`website` and `web_site` both print.** They are distinct keys holding the
+  same value, in Section 1 and Section 6 respectively. They are deliberately not
+  deduped — collapsing them would be this module deciding the form is redundant,
+  which is not its call.
+
+The `Additional Fields` fallback is retained: any submitted key the map does not
+recognise is still printed, with a humanized label, under a trailing section.
+The map is accurate today, but the form has already been revised once — when the
+next field is added and this file has not caught up, the reader still sees the
+value instead of the submission silently losing it.
 
 ## Storage layout
 
@@ -162,7 +180,7 @@ Notes for whoever provisions it:
 | --- | --- |
 | Auth type | `NONE` |
 | Invoke mode | `BUFFERED` (default) |
-| Allow origin | `https://www.spartancapital.us` |
+| Allow origin | `https://apply.spartancapitalgroup.com` |
 | Allow methods | `POST`, `OPTIONS` |
 | Allow headers | `content-type` |
 | Max age | `86400` |
@@ -170,6 +188,15 @@ Notes for whoever provisions it:
 
 Set `ALLOWED_ORIGIN` to the same origin — the handler emits its own CORS headers
 and does its own origin check, so the two must agree.
+
+**Confirm the origin before launch.** The onboarding page is a standalone HTML
+file served from S3/CloudFront, not part of the Next.js marketing site, so this
+is deliberately not `spartancapital.us`. `apply.spartancapitalgroup.com` is the
+intended host — whoever provisions this must replace it with wherever the page
+is actually served from. If the two disagree, **every submission fails CORS**:
+the browser blocks the request before it reaches the handler, so there is no
+CloudWatch line, no stored packet, and nothing to recover. It is the one
+misconfiguration here that loses submissions invisibly.
 
 `AuthType: NONE` is required because a public web form cannot sign SigV4. That
 leaves the URL open to anyone who finds it, on an endpoint that accepts PII.
