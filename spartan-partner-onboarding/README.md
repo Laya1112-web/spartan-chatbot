@@ -65,7 +65,7 @@ storing and reviewing. A mislabelled `action` is logged, not rejected.
 | `sheets.js` | Optional Google Sheets append via an Apps Script web app. Skipped silently when unconfigured; never fails the request |
 | `notify.js` | SES notification. Logs and swallows its own errors |
 | `sharepoint.js` | Optional Power Automate relay. Skipped silently when unconfigured; never fails the request |
-| `fields.js` | Pure: the six-section field map, the subject, and the plain-text body renderer |
+| `fields.js` | Pure: the six-section field map, the subject, and the short-alert email body |
 
 ### The field map
 
@@ -81,22 +81,22 @@ Two things about the revision, stated here so neither is undone by accident:
   label, or header for any of them exists in the map, and none can appear in the
   email.
 
-Two renderer behaviours the form depends on:
+**The map drives the sheet's columns, not the email.** Since the email became a
+short alert (below), `SECTIONS` has exactly one consumer that renders it:
+`sheets.js`. Rows have already been written against that column order, so
+changing a key, a label, or the order of this map silently misaligns the sheet
+against every row already in it. Treat the map as frozen unless you are also
+prepared to migrate the sheet.
 
-- **Empty values are skipped.** The reveal fields (`owner2_*`, `loc2_*`,
-  `loc_additional`, `scrub_other`, `outside_pct`) are submitted as empty strings
-  when the partner answered No. The email shows `Second Owner?: No` and moves
-  on, rather than printing blank labels.
-- **`website` and `web_site` both print.** They are distinct keys holding the
-  same value, in Section 1 and Section 6 respectively. They are deliberately not
-  deduped — collapsing them would be this module deciding the form is redundant,
-  which is not its call.
+`groupLead` — the full-dump renderer, with its `Additional Fields` fallback for
+unmapped keys — is still exported and still correct, but nothing calls it now
+that the email is an alert. It is kept rather than deleted; wiring it back into
+the notification would undo that change.
 
-The `Additional Fields` fallback is retained: any submitted key the map does not
-recognise is still printed, with a humanized label, under a trailing section.
-The map is accurate today, but the form has already been revised once — when the
-next field is added and this file has not caught up, the reader still sees the
-value instead of the submission silently losing it.
+- **`website` and `web_site` are both columns.** They are distinct keys holding
+  the same value, in Section 1 and Section 6 respectively. They are deliberately
+  not deduped — collapsing them would be this module deciding the form is
+  redundant, which is not its call.
 
 ### The one exception: `REMOVED_FIELDS`
 
@@ -124,6 +124,41 @@ a CloudWatch metric filter. Deleting an entry from `REMOVED_FIELDS` re-enables
 storage of that field, so treat the list as the record of a business decision,
 not as a tidy-up.
 
+## The notification email
+
+The email is a **short alert, not the submission**. It answers three questions —
+who submitted, when, and where the data is — and stops:
+
+```
+Partner onboarding submission received.
+
+ISO Legal Name: Redline Capital Partners LLC
+Owner Name: Dana Reyes
+Owner Email: dana@redlinecapital.example
+Owner Phone: —
+
+Received: 2026-09-16T13:45:12.884Z
+
+Full submission is in the Partner Onboarding tab of the Partner Form Submissions sheet.
+S3 Key: onboarding/2026/09/po_20260916T134512Z_9f3a1c74.json
+```
+
+Eleven lines, and **none of the other 59 mapped fields appear** — no labels, no
+values, no section headings, no `Additional Fields` block. The packet lives in
+the sheet and, durably, in S3; a reviewer who needs a field follows the pointer.
+Reprinting all 63 made the email long enough that nobody read it, and put a
+second copy of the partner's PII in every reviewer's inbox.
+
+The four identity lines always print. A missing or blank value shows an em dash
+rather than dropping the line, so every alert has the same shape and can be
+scanned by position.
+
+The **subject is unchanged**: `Partner Onboarding Completed — <ISO legal name>`,
+falling back to owner name, then owner email, then `Unknown Partner`.
+
+`sourceIp` and `bucket` are still passed to the renderer by `notify.js` and are
+deliberately not printed.
+
 ## The Google Sheets append
 
 `sheets.js` POSTs JSON to the `/exec` URL of a deployed Apps Script web app —
@@ -141,17 +176,15 @@ The body is exactly two equal-length arrays:
 **The columns come from `fields.js` and nowhere else.** There is deliberately no
 second column list in `sheets.js`: both arrays are generated from `SECTIONS`, in
 map order, with `Submission ID` and `Received At` as the first two columns. A
-field added to the map gets a column in the sheet and a line in the email; a
-field removed loses both. That is what keeps the sheet from drifting from the
-notification email. **65 columns**: the 2 envelope columns plus all 63 mapped
-fields.
+field added to the map gets a column in the sheet; a field removed loses one.
+**65 columns**: the 2 envelope columns plus all 63 mapped fields.
 
 Three behaviours worth knowing:
 
 - **Empty is `""`.** A missing, null, or whitespace-only field becomes an empty
   string — never `undefined`, `null`, or the string `"undefined"`. This is the
-  one place `sheets.js` must differ from the email, which skips blank fields: a
-  fixed-column sheet has to hold the column's place.
+  behaviour a fixed-column sheet requires: every column has to hold its place,
+  in every row.
 - **Colliding labels are qualified by section.** `website` (Your Information)
   and `web_site` (Online Presence) share the label `Website` in the map, so both
   headers become `Website (Your Information)` and `Website (Online Presence)`.
@@ -159,10 +192,9 @@ Three behaviours worth knowing:
   treats the header row as a lookup key, and two columns of the same name make
   any formula over them silently pick the first. The rule is derived from the
   map, so it cannot drift either.
-- **Unmapped keys are not appended.** The email prints them under
-  `Additional Fields`; the sheet cannot, because a row whose width changed per
-  submission would corrupt every column after the first new field. Those values
-  are still in the S3 object and still in the email.
+- **Unmapped keys are not appended.** A row whose width changed per submission
+  would corrupt every column after the first new field. Those values are still
+  in the S3 object — which is the reason the S3 key is printed in the alert.
 
 The request has a **10-second timeout** and follows redirects: a published Apps
 Script answers `/exec` with a 302 to `script.googleusercontent.com` that carries

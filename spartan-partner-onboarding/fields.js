@@ -186,6 +186,12 @@ function humanize(key) {
  * Returns [{ title, lines: ["Label: value", ...] }], omitting sections that
  * ended up empty. Any present key not in SECTIONS lands in "Additional Fields"
  * with a humanized label -- see the no-dropped-fields note at the top.
+ *
+ * NOT USED BY THE EMAIL any more. buildEmailBody became a short alert that
+ * prints four identity fields and a pointer; this full-dump renderer is kept
+ * because it is exported and still correct, but wiring it back into the
+ * notification would undo that change. The no-dropped-fields guarantee it
+ * implements now belongs to the S3 object and the sheet.
  */
 export function groupLead(lead) {
   const source = lead && typeof lead === "object" ? lead : {};
@@ -235,28 +241,59 @@ export function buildSubject(lead) {
 }
 
 /**
- * The full plain-text email body: every submitted field as `Label: value`,
- * grouped by section, with the envelope (id, timestamp, source IP) and the S3
- * key at the bottom so a reader who needs the raw JSON knows exactly where it
- * is.
+ * Printed in place of a missing identity value.
+ *
+ * The line is printed either way. A reader scanning a stack of these alerts is
+ * reading by position, and a line that vanishes when a field is blank makes
+ * every alert a slightly different shape -- so an absent owner phone shows as
+ * an em dash rather than closing the gap.
+ */
+const MISSING = "—";
+
+/**
+ * The four identity fields, in print order.
+ *
+ * The labels are written out here rather than read from SECTIONS on purpose.
+ * This alert is a fixed four-line shape that happens to name four of the form's
+ * fields; it is not a view of the field map, and it must not become one.
+ * sheets.js derives its column order from SECTIONS and a sheet has already been
+ * written against that order, so the fewer things reading that map, the fewer
+ * ways it can be pressured into changing.
+ */
+const IDENTITY_FIELDS = [
+  ["iso_legal", "ISO Legal Name"],
+  ["owner_name", "Owner Name"],
+  ["owner_email", "Owner Email"],
+  ["owner_phone", "Owner Phone"],
+];
+
+/**
+ * The plain-text email body: a short alert, not the submission.
+ *
+ * This deliberately does NOT print the packet. It answers three questions --
+ * who submitted, when, and where the data is -- and stops. The full 63 fields
+ * live in the Google Sheet and, durably, in S3; a reviewer who needs them
+ * follows the pointer at the bottom. Reprinting them here made the email long
+ * enough that nobody read it, and put a second copy of the partner's PII in
+ * every reviewer's inbox.
+ *
+ * `sourceIp` and `bucket` remain in the signature because notify.js passes them
+ * and the caller is not changing; they are intentionally not printed.
  */
 export function buildEmailBody({ lead, id, receivedAt, sourceIp, bucket, key }) {
+  const source = lead && typeof lead === "object" ? lead : {};
+
   const parts = ["Partner onboarding submission received.", ""];
 
-  for (const group of groupLead(lead)) {
-    parts.push(group.title.toUpperCase());
-    parts.push("-".repeat(group.title.length));
-    parts.push(...group.lines);
-    parts.push("");
+  for (const [field, label] of IDENTITY_FIELDS) {
+    parts.push(`${label}: ${present(source[field]) ? formatValue(source[field]) : MISSING}`);
   }
 
-  parts.push("SUBMISSION RECORD");
-  parts.push("-".repeat(17));
-  parts.push(`Submission ID: ${id}`);
-  parts.push(`Received: ${receivedAt}`);
-  if (present(sourceIp)) parts.push(`Source IP: ${sourceIp}`);
-  parts.push(`S3 Bucket: ${bucket}`);
-  parts.push(`S3 Key: ${key}`);
+  parts.push("");
+  parts.push(`Received: ${present(receivedAt) ? receivedAt : MISSING}`);
+  parts.push("");
+  parts.push("Full submission is in the Partner Onboarding tab of the Partner Form Submissions sheet.");
+  parts.push(`S3 Key: ${present(key) ? key : MISSING}`);
 
   return parts.join("\n");
 }
