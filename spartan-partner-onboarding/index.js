@@ -21,11 +21,14 @@
  * THE CONTRACT THAT MATTERS
  *
  * `success: true` means, and may only ever mean, that the submission is durably
- * in S3. The email and the SharePoint relay are best-effort deliveries layered
- * on top of that object and CANNOT influence the status code -- see notify.js
- * and sharepoint.js. A partner who completes a 67-field packet and is told it
- * was received, when it was not stored anywhere, is the failure this whole
- * function exists to eliminate. Any future change that lets a non-S3 failure
+ * in S3. The sheet row, the email, and the SharePoint relay are best-effort
+ * deliveries layered on top of that object and CANNOT influence the status code
+ * -- see sheets.js, notify.js and sharepoint.js. The sheet in particular is a
+ * convenience copy for whoever works the packets; S3 is the record.
+ *
+ * A partner who completes a 67-field packet and is told it was received, when
+ * it was not stored anywhere, is the failure this whole function exists to
+ * eliminate. Any future change that lets a non-S3 failure
  * produce a 500, or an S3 failure produce a 200, breaks the one promise this
  * code makes.
  *
@@ -45,6 +48,7 @@
 import { randomBytes } from "node:crypto";
 
 import { storeSubmission } from "./storage.js";
+import { appendToSheet } from "./sheets.js";
 import { sendNotification } from "./notify.js";
 import { relayToSharePoint } from "./sharepoint.js";
 
@@ -154,24 +158,44 @@ export const handler = async (event) => {
       fieldCount: Object.keys(lead).length,
     });
 
-    // Step 2 and 3 are best-effort. Both swallow their own errors; neither can
-    // change what this handler returns. They run in parallel because they are
-    // independent and the submitter is waiting.
-    const [notified, relayed] = await Promise.all([
-      sendNotification({
-        lead,
-        id,
-        receivedAt,
-        sourceIp,
-        bucket,
-        key,
-        from: process.env.SES_FROM,
-        to: process.env.NOTIFY_TO,
-      }),
-      relayToSharePoint({ url: process.env.SHAREPOINT_FLOW_URL, lead, id }),
-    ]);
+    // Steps 2, 3 and 4 are best-effort. Each swallows its own errors; none can
+    // change what this handler returns, and each is reached only because the S3
+    // write above already succeeded.
+    //
+    // They run in sequence, sheet -> email -> SharePoint, rather than in
+    // parallel. The order is the one the business asked for, and it is the
+    // useful one: the sheet is what the team actually works from, so it is
+    // populated before the email that tells a reviewer to go look at it.
+    // Each module is individually time-bounded (sheets.js 10s, sharepoint.js
+    // 5s), so the worst case here is bounded too -- keep the Lambda timeout
+    // comfortably above their sum.
+    const appended = await appendToSheet({
+      url: process.env.SHEETS_WEBHOOK_URL,
+      lead,
+      id,
+      receivedAt,
+    });
 
-    console.log("spartan-partner-onboarding: submission complete", { id, key, notified, relayed });
+    const notified = await sendNotification({
+      lead,
+      id,
+      receivedAt,
+      sourceIp,
+      bucket,
+      key,
+      from: process.env.SES_FROM,
+      to: process.env.NOTIFY_TO,
+    });
+
+    const relayed = await relayToSharePoint({ url: process.env.SHAREPOINT_FLOW_URL, lead, id });
+
+    console.log("spartan-partner-onboarding: submission complete", {
+      id,
+      key,
+      appended,
+      notified,
+      relayed,
+    });
 
     return json(200, headers, { success: true, id });
   } catch (error) {

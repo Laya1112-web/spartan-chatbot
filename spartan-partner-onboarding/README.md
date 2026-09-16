@@ -2,7 +2,7 @@
 
 Standalone AWS Lambda that receives the Spartan Capital Group partner (ISO)
 onboarding form, stores the submission in S3, emails the reviewers, and
-optionally relays the packet to SharePoint.
+optionally appends a row to a Google Sheet and relays the packet to SharePoint.
 
 It shares no code, no Function URL, and no execution role with
 `spartan-chatbot` or the Python `spartan-lead-handler`. It only follows their
@@ -21,16 +21,27 @@ the function name, full detail to CloudWatch and a safe message to the browser.
 | Non-POST | 405 | `{ "success": false, "error": "…" }` |
 | OPTIONS preflight | 204 | empty, with CORS headers |
 
-The email and the SharePoint relay are best-effort deliveries layered on top of
-an object that is already durable. **Neither can change the status code.** A
-partner who completes a 67-field packet and is told it was received, when
-nothing was stored, is the failure this function exists to eliminate — so an S3
-failure must always be a 500, and an SES or SharePoint failure must never be.
+The sheet row, the email, and the SharePoint relay are best-effort deliveries
+layered on top of an object that is already durable. **None of them can change
+the status code.** A partner who completes a 67-field packet and is told it was
+received, when nothing was stored, is the failure this function exists to
+eliminate — so an S3 failure must always be a 500, and a Sheets, SES, or
+SharePoint failure must never be.
 
-A failed notification is logged as
-`spartan-partner-onboarding: notification failed, submission IS saved`. That log
-line is the only signal that a packet is saved but unreviewed; it is worth a
-CloudWatch metric filter and an alarm.
+After the S3 write the three run in sequence: **sheet, then email, then
+SharePoint.** The sheet is what the team actually works from, so it is populated
+before the email that tells a reviewer to go look at it.
+
+Two log lines are worth a CloudWatch metric filter and an alarm, because each is
+the only signal that a stored packet is invisible somewhere it should not be:
+
+```
+spartan-partner-onboarding: notification failed, submission IS saved
+spartan-partner-onboarding: sheets append failed, submission IS saved
+```
+
+Both carry the submission id, so a missing sheet row or an unsent email can be
+traced back to the object in S3.
 
 ## Request
 
@@ -51,6 +62,7 @@ storing and reviewing. A mislabelled `action` is logged, not rejected.
 | --- | --- |
 | `index.js` | Function URL entry: CORS, method routing, validation, orchestration, response |
 | `storage.js` | The S3 write. Throws on failure by design — the only thing that can fail the request |
+| `sheets.js` | Optional Google Sheets append via an Apps Script web app. Skipped silently when unconfigured; never fails the request |
 | `notify.js` | SES notification. Logs and swallows its own errors |
 | `sharepoint.js` | Optional Power Automate relay. Skipped silently when unconfigured; never fails the request |
 | `fields.js` | Pure: the six-section field map, the subject, and the plain-text body renderer |
@@ -112,6 +124,55 @@ a CloudWatch metric filter. Deleting an entry from `REMOVED_FIELDS` re-enables
 storage of that field, so treat the list as the record of a business decision,
 not as a tidy-up.
 
+## The Google Sheets append
+
+`sheets.js` POSTs JSON to the `/exec` URL of a deployed Apps Script web app —
+the same no-auth arrangement the Python `spartan-lead-handler` uses for leads.
+There is no service account, no `googleapis` client, and no new dependency: it
+uses the Node 20 runtime's global `fetch`, as `sharepoint.js` does. The Apps
+Script owns the spreadsheet id and the permission to write to it.
+
+The body is exactly two equal-length arrays:
+
+```json
+{ "headers": ["Submission ID", "Received At", …], "values": ["po_…", "2026-09-16T…Z", …] }
+```
+
+**The columns come from `fields.js` and nowhere else.** There is deliberately no
+second column list in `sheets.js`: both arrays are generated from `SECTIONS`, in
+map order, with `Submission ID` and `Received At` as the first two columns. A
+field added to the map gets a column in the sheet and a line in the email; a
+field removed loses both. That is what keeps the sheet from drifting from the
+notification email. **65 columns**: the 2 envelope columns plus all 63 mapped
+fields.
+
+Three behaviours worth knowing:
+
+- **Empty is `""`.** A missing, null, or whitespace-only field becomes an empty
+  string — never `undefined`, `null`, or the string `"undefined"`. This is the
+  one place `sheets.js` must differ from the email, which skips blank fields: a
+  fixed-column sheet has to hold the column's place.
+- **Colliding labels are qualified by section.** `website` (Your Information)
+  and `web_site` (Online Presence) share the label `Website` in the map, so both
+  headers become `Website (Your Information)` and `Website (Online Presence)`.
+  Both still get their own column — they are not deduped — but a spreadsheet
+  treats the header row as a lookup key, and two columns of the same name make
+  any formula over them silently pick the first. The rule is derived from the
+  map, so it cannot drift either.
+- **Unmapped keys are not appended.** The email prints them under
+  `Additional Fields`; the sheet cannot, because a row whose width changed per
+  submission would corrupt every column after the first new field. Those values
+  are still in the S3 object and still in the email.
+
+The request has a **10-second timeout** and follows redirects: a published Apps
+Script answers `/exec` with a 302 to `script.googleusercontent.com` that carries
+the real response, so a client that does not follow it learns nothing. Node 20's
+`fetch` follows by default; `redirect: "follow"` is set explicitly anyway so the
+dependency is visible at the call site.
+
+Deploy the script as **Execute as: Me**, **Who has access: Anyone**, or the POST
+receives an HTML sign-in page instead of a 200.
+
 ## Storage layout
 
 ```
@@ -132,9 +193,14 @@ function must not silently repoint either.
 
 ## Environment variables
 
-`SUBMISSIONS_BUCKET`, `SES_FROM`, `NOTIFY_TO`, `SHAREPOINT_FLOW_URL` (optional),
-`ALLOWED_ORIGIN`. See `.env.example` for the intended values and the behaviour
-when each is unset. Nothing is hardcoded.
+`SUBMISSIONS_BUCKET`, `SES_FROM`, `NOTIFY_TO`, `ALLOWED_ORIGIN`, plus the two
+optional webhook URLs `SHEETS_WEBHOOK_URL` and `SHAREPOINT_FLOW_URL`. See
+`.env.example` for the intended values and the behaviour when each is unset.
+Nothing is hardcoded.
+
+`SHEETS_WEBHOOK_URL` is a placeholder in `.env.example` — set the real Apps
+Script deployment URL at provisioning. When it is unset or empty the append is
+skipped silently, which is a supported configuration, not an error.
 
 ## Deploy
 
