@@ -3,7 +3,7 @@
  * partner (ISO) onboarding form. Invoked through its own Lambda Function URL
  * (buffered, payload format 2.0); there is no API Gateway in front of it.
  *
- *   OPTIONS /  CORS preflight -> 204
+ *   OPTIONS /  -> 204 (the Function URL answers real preflights itself)
  *
  *   POST /  { action: "partner_onboarding", lead: { ...~67 flat fields } }
  *        -> 200 { success: true, id }   the packet is in S3
@@ -89,12 +89,33 @@ const REMOVED_FIELDS = [
 /** Shown to the browser when the S3 write fails. No internals leak. */
 const GENERIC_ERROR = "Sorry — we could not save your submission. Please try again in a moment.";
 
+/**
+ * The only headers this handler sets.
+ *
+ * THIS FUNCTION DOES NOT EMIT CORS HEADERS. The Function URL's own CORS
+ * configuration owns them -- it sets Access-Control-Allow-Origin, -Methods,
+ * -Headers, -Max-Age and Vary on every response, and answers preflight without
+ * invoking this code at all.
+ *
+ * This handler used to set them too, from an ALLOWED_ORIGIN env var. Because
+ * both layers were emitting, responses carried Access-Control-Allow-Origin and
+ * Vary TWICE, and a browser rejects a response with more than one
+ * Access-Control-Allow-Origin value -- so every submission failed in the
+ * browser while curl saw a clean 200. One owner, not two: re-adding CORS here
+ * re-creates that bug, and it is invisible to anything but a real browser.
+ *
+ * ALLOWED_ORIGIN is consequently unread by this code. The allowed origin now
+ * lives only in the Function URL config.
+ */
+const RESPONSE_HEADERS = { "Content-Type": "application/json" };
+
 export const handler = async (event) => {
-  const origin = getHeader(event, "origin");
-  const headers = corsHeaders(origin);
+  const headers = RESPONSE_HEADERS;
   const method = event?.requestContext?.http?.method ?? "POST";
 
-  // CORS preflight.
+  // Kept for a non-browser caller that sends OPTIONS, and so a direct
+  // invocation of this handler still behaves. UNREACHABLE from a browser: the
+  // Function URL answers preflight itself and never invokes the function.
   if (method === "OPTIONS") {
     return { statusCode: 204, headers, body: "" };
   }
@@ -235,54 +256,6 @@ function generateId() {
   return `po_${stamp}_${randomBytes(4).toString("hex")}`;
 }
 
-/**
- * CORS. The allowed origin comes from ALLOWED_ORIGIN (comma-separated for more
- * than one) -- nothing is hardcoded here, unlike spartan-chatbot, whose origin
- * set is baked in.
- *
- * When ALLOWED_ORIGIN is unset no Access-Control-Allow-Origin is emitted and
- * browsers will block the form. That is the safe default for an endpoint that
- * accepts PII, but it is also a silent-looking failure, so it is logged.
- */
-function corsHeaders(origin) {
-  const headers = {
-    "Content-Type": "application/json",
-    // Response varies per Origin — keep caches from serving one site's CORS
-    // headers to another.
-    Vary: "Origin",
-  };
-
-  const allowed = process.env.ALLOWED_ORIGIN;
-
-  if (!allowed) {
-    console.warn("spartan-partner-onboarding: ALLOWED_ORIGIN is unset, browser requests will be blocked");
-    return headers;
-  }
-
-  const permitted = new Set(
-    String(allowed)
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean),
-  );
-
-  if (origin && (permitted.has(origin) || permitted.has("*"))) {
-    headers["Access-Control-Allow-Origin"] = permitted.has("*") ? "*" : origin;
-    headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
-    headers["Access-Control-Allow-Headers"] = "Content-Type";
-    headers["Access-Control-Max-Age"] = "86400";
-  }
-
-  return headers;
-}
-
-function getHeader(event, name) {
-  const headers = event?.headers ?? {};
-  // Function URLs lower-case header keys, but don't depend on it.
-  const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
-  return key ? headers[key] : undefined;
-}
-
 function parseBody(event) {
   const raw = event?.body;
   if (!raw) throw new BadRequestError("Request body is required.");
@@ -343,4 +316,4 @@ function json(statusCode, headers, payload) {
 }
 
 // Exported for tests only; the Lambda entry point is `handler`.
-export { generateId, corsHeaders, parseBody };
+export { generateId, parseBody };
